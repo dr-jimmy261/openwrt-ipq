@@ -731,6 +731,16 @@
  	if (!peer) {
  		spin_unlock_bh(&ab->base_lock);
  		return -ENOENT;
+@@ -4410,8 +4410,8 @@ static int ath11k_set_group_keys(struct
+	struct ath11k_peer *peer;
+
+	spin_lock_bh(&ab->base_lock);
+-	peer = ath11k_peer_find(ab, arvif->vdev_id, addr);
++	peer = ath11k_peer_find(ar, arvif->vdev_id, addr);
+	spin_unlock_bh(&ab->base_lock);
+
+	if (!peer)
+		return -ENOENT;
 @@ -4488,7 +4488,7 @@ static int ath11k_mac_op_set_key(struct
  	 * we already hold conf_mutex. we just make sure its there now.
  	 */

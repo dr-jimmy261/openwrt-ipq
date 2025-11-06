@@ -138,10 +138,10 @@ Signed-off-by: Sathishkumar Muruganandam <murugana@codeaurora.org>
  	if (cmd == DISABLE_KEY) {
  		/* TODO: Check if FW expects  value other than NONE for del */
  		/* arg.key_cipher = WMI_CIPHER_NONE; */
-@@ -4355,15 +4389,40 @@ static int ath11k_clear_peer_keys(struct
+@@ -4387,16 +4421,41 @@ static int ath11k_clear_peer_keys(struct
  	return first_errno;
  }
- 
+
 +static int ath11k_get_vlan_groupkey_index(struct ath11k_vif *arvif,
 +					  struct ieee80211_key_conf *key)
 +{
@@ -178,6 +178,7 @@ Signed-off-by: Sathishkumar Muruganandam <murugana@codeaurora.org>
  	struct ath11k_peer *peer;
 -	struct ath11k_sta *arsta;
 +	struct ath11k_sta *arsta = NULL;
+	bool is_ap_with_no_sta;
  	const u8 *peer_addr;
  	int ret = 0;
  	u32 flags = 0;
