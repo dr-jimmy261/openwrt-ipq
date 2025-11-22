@@ -132,6 +132,7 @@ platform_do_upgrade() {
 	compex,wpq873|\
 	dynalink,dl-wrx36|\
 	edimax,cax1800|\
+	swaiot,s10sky|\
 	netgear,rax120v2|\
 	netgear,sxr80|\
 	netgear,sxs80|\
