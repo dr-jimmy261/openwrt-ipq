@@ -79,7 +79,7 @@
 			label = "ethyellow";
 			gpios = <&tlmm 56 GPIO_ACTIVE_LOW>;
 		};
-
+		
 		5gblue {
 			label = "5gblue";
 			gpios = <&tlmm 63 GPIO_ACTIVE_HIGH>;
@@ -106,6 +106,27 @@
 			function = "mdio";
 			drive-strength = <8>;
 			bias-pull-up;
+		};
+
+		mux_2 {
+			pins = "gpio25";
+			function = "gpio";
+			bias-pull-up;
+		};
+		
+		mux_3 {
+			pins = "gpio48";
+			function = "gpio";
+			bias-pull-up;
+		};
+	};
+
+	ws223 {
+		mux {
+			pins = "gpio46", "gpio47";
+			function = "gpio";
+			drive-strength = <8>;
+			bias-pull-down;
 		};
 	};
 
@@ -287,7 +308,7 @@
 	reg = <24>;
 	reset-deassert-us = <10000>;
 	reset-gpios = <&tlmm 48 GPIO_ACTIVE_LOW>;
-	
+
 	leds {
 		#address-cells = <1>;
 		#size-cells = <0>;
