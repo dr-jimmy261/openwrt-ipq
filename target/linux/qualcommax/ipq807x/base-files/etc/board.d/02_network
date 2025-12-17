@@ -38,6 +38,7 @@ ipq807x_setup_interfaces()
 		ucidef_set_interfaces_lan_wan "lan1 lan2 lan3" "wan"
 		;;
 	edgecore,eap102|\
+	tcl,hh500v|\
 	yuncore,ax880|\
 	zte,mf269)
 		ucidef_set_interfaces_lan_wan "lan" "wan"
@@ -99,6 +100,10 @@ ipq807x_setup_macs()
 		tplink,eap660hd-v1)
 			label_mac=$(get_mac_binary /tmp/factory_data/default-mac 0)
 			lan_mac=$label_mac
+		;;
+		tcl,hh500v)
+		wan_mac=$(mtd_get_mac_binary "0:ART" 0x5e290)
+		lan_mac=$(mtd_get_mac_binary "0:ART" 0x5e296)
 		;;
 	esac
 
