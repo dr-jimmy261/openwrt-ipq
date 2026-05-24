@@ -1,0 +1,1326 @@
+#!/bin/ash
+# Modem Signal Collector — queries serving-cell signal metrics per vendor
+# Outputs key=value lines to /tmp/modem-signal and stdout
+
+AT_DEVICES="/dev/wwan0at0 /dev/ttyUSB2 /dev/ttyUSB1 /dev/ttyUSB0 /dev/mhi_DUN /dev/mhi_AT"
+STATE_FILE="/tmp/modem-state"
+SIGNAL_FILE="/tmp/modem-signal"
+LTE_SCC_COUNT=0
+LTE_SCC_DATA=""
+AT_LOCK=/tmp/modem-at.lock
+AT_LOCKED=0
+
+release_at_lock() {
+  if [ "$AT_LOCKED" = 1 ]; then
+    local owner
+    owner=$(cat "$AT_LOCK/pid" 2>/dev/null)
+    if [ "$owner" = "$$" ]; then
+      rm -f "$AT_LOCK/pid"
+      rmdir "$AT_LOCK" 2>/dev/null
+    fi
+    AT_LOCKED=0
+  fi
+}
+
+acquire_at_lock() {
+  local owner
+  if ! mkdir "$AT_LOCK" 2>/dev/null; then
+    owner=$(cat "$AT_LOCK/pid" 2>/dev/null)
+    case "$owner" in
+      ""|*[!0-9]*)
+        sleep 1
+        owner=$(cat "$AT_LOCK/pid" 2>/dev/null)
+        ;;
+    esac
+    [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null && return 1
+    rm -f "$AT_LOCK/pid"
+    rmdir "$AT_LOCK" 2>/dev/null
+    mkdir "$AT_LOCK" 2>/dev/null || return 1
+  fi
+  AT_LOCKED=1
+  printf '%s\n' "$$" > "$AT_LOCK/pid"
+}
+
+trap release_at_lock EXIT
+trap 'release_at_lock; exit 1' HUP INT TERM
+
+# ─── AT tool detection ────────────────────────────────────────────────────
+detect_at_tool() {
+  if command -v sms_tool_q >/dev/null 2>&1; then
+    echo "sms_tool_q"
+  elif command -v sms_tool >/dev/null 2>&1; then
+    echo "sms_tool"
+  else
+    echo ""
+  fi
+}
+
+# ─── AT device detection ─────────────────────────────────────────────────
+at_device_allowed() {
+  case " $AT_DEVICES " in
+    *" $1 "*) return 0 ;;
+    *)        return 1 ;;
+  esac
+}
+
+at_device_available() {
+  [ -c "$1" ]
+}
+
+response_has_ok() {
+  printf '%s\n' "$1" | tr -d '\r' | grep -q '^[[:space:]]*OK[[:space:]]*$'
+}
+
+detect_at_device() {
+  local preferred tested="" dev resp
+  preferred=$(read_state "at_device")
+
+  # The modem manager has already identified the working AT interface.  Try
+  # that allowlisted device first instead of waiting on unrelated tty ports.
+  if [ -n "$preferred" ] && at_device_allowed "$preferred" && at_device_available "$preferred"; then
+    tested="$preferred"
+    resp=$("$AT_TOOL" -D -d "$preferred" at "AT" 2>&1)
+    if response_has_ok "$resp"; then
+      echo "$preferred"
+      return 0
+    fi
+  fi
+
+  # State can be stale during a modem reset, so retain the ordered scan as a
+  # fallback and do not probe the failed preferred device a second time.
+  for dev in $AT_DEVICES; do
+    [ "$dev" = "$tested" ] && continue
+    at_device_available "$dev" || continue
+    resp=$("$AT_TOOL" -D -d "$dev" at "AT" 2>&1)
+    if response_has_ok "$resp"; then
+      echo "$dev"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# ─── Read modem state file ───────────────────────────────────────────────
+read_state() {
+  local key="$1"
+  if [ -f "$STATE_FILE" ]; then
+    grep "^${key}=" "$STATE_FILE" 2>/dev/null | head -1 | cut -d= -f2-
+  fi
+}
+
+# ─── Vendor detection (USB VID → vendor; PCIe model name → vendor) ───────
+detect_vendor() {
+  # USB: scan sysfs for known modem VIDs
+  for devpath in /sys/bus/usb/devices/[0-9]*; do
+    [ -d "$devpath" ] || continue
+    local vid
+    vid=$(cat "$devpath/idVendor" 2>/dev/null)
+    [ -z "$vid" ] && continue
+    case "$vid" in
+      2c7c) echo "quectel"; return 0 ;;
+      0e8d) echo "fibocom"; return 0 ;;
+      2cb7) echo "fibocom"; return 0 ;;
+      1199) echo "sierra"; return 0 ;;
+      2dee) echo "meig"; return 0 ;;
+    esac
+  done
+
+  # PCIe: use model name from state file
+  local model
+  model=$(read_state "modem")
+  if [ -n "$model" ]; then
+    case "$model" in
+      *T99W373*|*T99W640*|*T99W*|*DP25*|*FDE*) echo "foxconn"; return 0 ;;
+      *FM350*) echo "fibocom"; return 0 ;;
+      *FM150*|*FM160*) echo "fibocom"; return 0 ;;
+      *RM5*|*EC2*|*EC2*|*EM06*|*EM12*|*EM16*|*RG5*|*RG2*) echo "quectel"; return 0 ;;
+      *SDX55*|*SDX62*|*SDX72*) echo "quectel"; return 0 ;;
+    esac
+  fi
+
+  echo "unknown"
+}
+
+# ─── AT command helper ───────────────────────────────────────────────────
+at_cmd() {
+  "$AT_TOOL" -D -d "$AT_DEV" at "$1" 2>&1
+}
+
+# ─── Convert CSQ to RSSI ─────────────────────────────────────────────────
+csq_to_rssi() {
+  local csq="$1"
+  if [ -n "$csq" ] && [ "$csq" != "99" ] && [ "$csq" -ge 0 ] 2>/dev/null; then
+    echo $(( 2 * csq - 113 ))
+  fi
+}
+
+# Convert a modem-reported hexadecimal cell identity to decimal.  Keep the
+# original value if it is not a valid hexadecimal number so a malformed modem
+# response does not erase the Cell ID from the signal view.
+hex_cell_id_to_decimal() {
+  local value hex converted
+  value=$(printf '%s' "$1" | tr -d '\r\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/^"//;s/"$//')
+  [ -z "$value" ] && return
+
+  case "$value" in
+    0x*|0X*) hex=${value#0x}; hex=${hex#0X} ;;
+    *)       hex=$value ;;
+  esac
+
+  case "$hex" in
+    ''|*[!0-9A-Fa-f]*) printf '%s\n' "$value"; return ;;
+  esac
+
+  converted=$(printf '%d' "0x$hex" 2>/dev/null)
+  [ -n "$converted" ] && printf '%s\n' "$converted" || printf '%s\n' "$value"
+}
+
+# Decimal is the signal-file contract.  This catches explicitly marked hex
+# values from any vendor, while leaving ambiguous digits-only decimal IDs
+# untouched (MeiG and Foxconn report those in decimal).
+normalize_cell_id_decimal() {
+  local value
+  value=$(printf '%s' "$1" | tr -d '\r\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+  case "$value" in
+    0x*|0X*|*[A-Fa-f]*) hex_cell_id_to_decimal "$value" ;;
+    *)                  printf '%s\n' "$value" ;;
+  esac
+}
+
+# ─── Convert bandwidth index to MHz (adapted from reference) ─────────────
+get_bandwidth() {
+  local net="$1" n="$2"
+  [ -z "$n" ] || ! echo "$n" | grep -q '^[0-9]*$' && return
+  case "$net" in
+    LTE)
+      case "$n" in
+        0) echo "1.4" ;; 1) echo "3" ;;
+        2|3|4|5) echo $(( (n - 1) * 5 )) ;;
+      esac ;;
+    NR)
+      case "$n" in
+        0|1|2|3|4|5) echo $(( (n + 1) * 5 )) ;;
+        6|7|8|9|10|11|12) echo $(( (n - 2) * 10 )) ;;
+        13) echo "200" ;; 14) echo "400" ;;
+      esac ;;
+  esac
+}
+
+# ─── LTE carrier-aggregation helpers ─────────────────────────────────────
+lte_ca_bandwidth() {
+  case "$1" in
+    6) echo "1.4" ;; 15) echo "3" ;; 25) echo "5" ;;
+    50) echo "10" ;; 75) echo "15" ;; 100) echo "20" ;;
+  esac
+}
+
+fibocom_lte_rsrp() {
+  echo "$1" | grep -Eq '^-?[0-9]+$' || return
+  if [ "$1" -lt 0 ] 2>/dev/null; then
+    echo "$1"
+  else
+    echo $(( $1 - 141 ))
+  fi
+}
+
+fibocom_is_fm350() {
+  case "$(read_state "modem")" in
+    *FM350*) return 0 ;;
+    *)       return 1 ;;
+  esac
+}
+
+fibocom_channel_or_pci() {
+  local value
+  value=$(echo "$1" | tr -d ' \r\n')
+  [ -z "$value" ] && return
+  if [ "$2" = "1" ]; then
+    echo "$value"
+  else
+    printf "%d" "0x$value" 2>/dev/null
+  fi
+}
+
+clean_scc_value() {
+  printf '%s' "$1" | tr -d '\r\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//'
+}
+
+normalize_lte_band() {
+  local value
+  value=$(clean_scc_value "$1" | sed 's/^"//;s/"$//;s/^LTE[[:space:]]*BAND[[:space:]]*//')
+  case "$value" in
+    B*|b*) echo "B${value#?}" ;;
+    ''|-) echo "" ;;
+    *) echo "B$value" ;;
+  esac
+}
+
+add_lte_scc() {
+  local state band bandwidth pci channel rsrp rsrp_unit rsrq rssi sinr prefix record
+  state=$(clean_scc_value "$1")
+  band=$(normalize_lte_band "$2")
+  bandwidth=$(clean_scc_value "$3")
+  pci=$(clean_scc_value "$4")
+  channel=$(clean_scc_value "$5")
+  rsrp=$(clean_scc_value "$6")
+  rsrp_unit=$(clean_scc_value "$7")
+  rsrq=$(clean_scc_value "$8")
+  rssi=$(clean_scc_value "$9")
+  sinr=$(clean_scc_value "${10}")
+
+  LTE_SCC_COUNT=$((LTE_SCC_COUNT + 1))
+  prefix="lte_scc_${LTE_SCC_COUNT}"
+  record="${prefix}_state=${state}
+${prefix}_band=${band}
+${prefix}_bandwidth=${bandwidth}
+${prefix}_pci=${pci}
+${prefix}_channel=${channel}
+${prefix}_rsrp=${rsrp}
+${prefix}_rsrp_unit=${rsrp_unit}
+${prefix}_rsrq=${rsrq}
+${prefix}_rssi=${rssi}
+${prefix}_sinr=${sinr}"
+  if [ -n "$LTE_SCC_DATA" ]; then
+    LTE_SCC_DATA="${LTE_SCC_DATA}
+${record}"
+  else
+    LTE_SCC_DATA="$record"
+  fi
+}
+
+parse_quectel_lte_scc() {
+  local response="$1" lines line state state_label band bandwidth pci channel rsrp rsrq rssi sinr
+  lines=$(echo "$response" | grep '+QCAINFO: "SCC"' | grep '"LTE BAND ')
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    state=$(echo "$line" | awk -F',' '{print $5}' | tr -d ' \r\n')
+    case "$state" in
+      2) state_label="active" ;;
+      1) state_label="inactive" ;;
+      *) continue ;;
+    esac
+    channel=$(echo "$line" | awk -F',' '{print $2}')
+    bandwidth=$(lte_ca_bandwidth "$(echo "$line" | awk -F',' '{print $3}' | tr -d ' \r\n')")
+    band=$(echo "$line" | awk -F',' '{print $4}')
+    pci=$(echo "$line" | awk -F',' '{print $6}')
+    rsrp=$(echo "$line" | awk -F',' '{print $7}')
+    rsrq=$(echo "$line" | awk -F',' '{print $8}')
+    rssi=$(echo "$line" | awk -F',' '{print $9}')
+    sinr=$(echo "$line" | awk -F',' '{print $10}')
+    add_lte_scc "$state_label" "$band" "$bandwidth" "$pci" "$channel" "$rsrp" "dBm" "$rsrq" "$rssi" "$sinr"
+  done <<EOF
+$lines
+EOF
+}
+
+parse_fibocom_lte_scc() {
+  local response="$1" lines line data state state_label band_code band_num band bandwidth pci channel rsrp_raw rsrp
+  # Some Fibocom firmware omits the optional "LTE" prefix or inserts spaces
+  # in the carrier label (for example, "SCC 1:" instead of "SCC1:").
+  # Select SCC records directly, then distinguish LTE from NR by band code.
+  lines=$(echo "$response" | grep -E '^[[:space:]]*(LTE[[:space:]]+)?SCC[[:space:]]*[0-9]+[[:space:]]*:')
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    data=${line#*:}
+    state=$(echo "$data" | awk -F',' '{print $1}' | tr -d ' \r\n')
+    case "$state" in
+      2) state_label="active" ;;
+      1) state_label="inactive" ;;
+      *) continue ;;
+    esac
+    band_code=$(echo "$data" | awk -F',' '{print $3}' | tr -d ' \r\n')
+    case "$band_code" in
+      1[0-9][0-9])
+        band_num=$((band_code - 100))
+        [ "$band_num" -ge 1 ] && [ "$band_num" -le 71 ] || continue
+        band="B$band_num"
+        ;;
+      *) continue ;;
+    esac
+    pci=$(echo "$data" | awk -F',' '{print $4}')
+    channel=$(echo "$data" | awk -F',' '{print $5}')
+    bandwidth=$(lte_ca_bandwidth "$(echo "$data" | awk -F',' '{print $6}' | tr -d ' \r\n')")
+    rsrp_raw=$(echo "$data" | awk -F',' '{print $12}' | tr -d ' \r\n')
+    rsrp=$(fibocom_lte_rsrp "$rsrp_raw")
+    add_lte_scc "$state_label" "$band" "$bandwidth" "$pci" "$channel" "$rsrp" "dBm" "" "" ""
+  done <<EOF
+$lines
+EOF
+}
+
+parse_meig_lte_scc() {
+  local response="$1" lines line data carrier state state_label band bandwidth pci channel rsrp rsrq rssi sinr sinr_raw
+  lines=$(echo "$response" | grep 'CELLINFO:' | grep '"SCC"')
+  while IFS= read -r line; do
+    [ -n "$line" ] || continue
+    data=${line#*CELLINFO:}
+    carrier=$(echo "$data" | awk -F',' '{print $1}' | tr -d ' "\r\n')
+    [ "$carrier" = "SCC" ] || continue
+    state=$(echo "$data" | awk -F',' '{print $3}' | tr -d ' \r\n')
+    case "$state" in
+      2) state_label="active" ;;
+      1) state_label="inactive" ;;
+      *) continue ;;
+    esac
+    channel=$(echo "$data" | awk -F',' '{print $5}')
+    bandwidth=$(lte_ca_bandwidth "$(echo "$data" | awk -F',' '{print $6}' | tr -d ' \r\n')")
+    band=$(echo "$data" | awk -F',' '{print $7}')
+    pci=$(echo "$data" | awk -F',' '{print $8}')
+    rsrq=$(echo "$data" | awk -F',' '{print $9}')
+    rsrp=$(echo "$data" | awk -F',' '{print $10}')
+    rssi=$(echo "$data" | awk -F',' '{print $11}')
+    sinr_raw=$(echo "$data" | awk -F',' '{print $12}' | tr -d ' \r\n')
+    sinr=""
+    if echo "$sinr_raw" | grep -Eq '^-?[0-9]+([.][0-9]+)?$'; then
+      sinr=$(awk -v raw="$sinr_raw" 'BEGIN { printf "%.1f", raw / 10 }')
+    fi
+    add_lte_scc "$state_label" "$band" "$bandwidth" "$pci" "$channel" "$rsrp" "dBm" "$rsrq" "$rssi" "$sinr"
+  done <<EOF
+$lines
+EOF
+}
+
+parse_foxconn_lte_scc() {
+  local response="$1" records band bandwidth pci channel rsrp rsrq rssi sinr
+
+  # Foxconn reports each LTE secondary carrier as a multiline block:
+  #   scell: lte_band:<band> lte_band_width:<MHz>MHz
+  #   channel:<earfcn> pci:<pci>
+  #   lte_rsrp:<dBm>dBm,rsrq:<dB>dB
+  #   lte_rssi:<dBm>dBm,lte_snr:<dB>dB
+  # Collapse every complete block into one record before updating the global
+  # SCC accumulator (a piped shell loop would update it in a subshell).
+  records=$(printf '%s\n' "$response" | awk '
+    function metric(line, key, value) {
+      value = line
+      sub(".*" key ":[[:space:]]*", "", value)
+      sub("[^0-9+.-].*$", "", value)
+      return value
+    }
+    function emit() {
+      if (in_scell && band != "" && channel != "")
+        print band "|" bandwidth "|" pci "|" channel "|" rsrp "|" rsrq "|" rssi "|" sinr
+      in_scell = 0
+    }
+    /^[[:space:]]*scell:[[:space:]]*/ {
+      emit()
+      in_scell = 1
+      band = bandwidth = pci = channel = rsrp = rsrq = rssi = sinr = ""
+      if (index($0, "lte_band:")) band = metric($0, "lte_band")
+      if (index($0, "lte_band_width:")) bandwidth = metric($0, "lte_band_width")
+      next
+    }
+    in_scell && /^[[:space:]]*channel:/ {
+      channel = metric($0, "channel")
+      if (index($0, "pci:")) pci = metric($0, "pci")
+      next
+    }
+    in_scell && /^[[:space:]]*lte_rsrp:/ {
+      rsrp = metric($0, "lte_rsrp")
+      if (index($0, "rsrq:")) rsrq = metric($0, "rsrq")
+      next
+    }
+    in_scell && /^[[:space:]]*lte_rssi:/ {
+      rssi = metric($0, "lte_rssi")
+      if (index($0, "lte_snr:")) sinr = metric($0, "lte_snr")
+      emit()
+      next
+    }
+    in_scell && /^[[:space:]]*(nr_|pcell:|RAT:|OK[[:space:]]*$)/ {
+      emit()
+      next
+    }
+    END { emit() }
+  ')
+
+  while IFS='|' read -r band bandwidth pci channel rsrp rsrq rssi sinr; do
+    [ -n "$band" ] && [ -n "$channel" ] || continue
+    add_lte_scc "active" "$band" "$bandwidth" "$pci" "$channel" "$rsrp" "dBm" "$rsrq" "$rssi" "$sinr"
+  done <<EOF
+$records
+EOF
+}
+
+# ─── Get modem temperature (per-vendor) ──────────────────────────────────
+parse_quectel_temperature() {
+  local response="$1" preferred
+
+  # Prefer the application-processor sensor. Validate the quoted value so
+  # digits in sensor names (cpu0, pa1, etc.) can never become temperatures.
+  preferred=$(printf '%s\n' "$response" | awk -F'"' '
+    /^\+QTEMP:/ && $2 == "cpu0-a7-usr" {
+      value = $4
+      numeric = value + 0
+      if (value ~ /^-?[0-9]+([.][0-9]+)?$/ && numeric > 10 && numeric < 110) {
+        print value
+        exit
+      }
+    }
+  ')
+  if [ -n "$preferred" ]; then
+    printf '%s\n' "$preferred"
+    return 0
+  fi
+
+  # Compatibility fallback for Quectel firmware without cpu0-a7-usr. Read
+  # only the final value field, supporting quoted and unquoted QTEMP layouts.
+  printf '%s\n' "$response" | awk -F'"' '
+    /^\+QTEMP:/ {
+      if (NF >= 4) {
+        value = $4
+      } else {
+        value = $0
+        if (index(value, ",")) {
+          count = split(value, fields, ",")
+          value = fields[count]
+        } else {
+          count = split(value, fields, ":")
+          value = fields[count]
+        }
+      }
+      gsub(/[[:space:]\r]/, "", value)
+      numeric = value + 0
+      if (value ~ /^-?[0-9]+([.][0-9]+)?$/ && numeric > 10 && numeric < 110) {
+        print value
+        exit
+      }
+    }
+  '
+}
+
+get_temperature() {
+  local resp t="" pre
+  case "$VENDOR" in
+    quectel)
+      resp=$(at_cmd "AT+QTEMP")
+      t=$(parse_quectel_temperature "$resp")
+      ;;
+    fibocom)
+      local model raw_temp
+      model=$(read_state "modem")
+      case "$model" in
+        *FM350*)
+          resp=$(at_cmd "AT+GTSENRDTEMP=2")
+          raw_temp=$(echo "$resp" | grep -E '^\+GTSENRDTEMP:[[:space:]]*2,' | head -1 | awk -F',' '{print $2}' | tr -d ' \r\n')
+          t=$(awk -v raw="$raw_temp" 'BEGIN { if (raw ~ /^[0-9]+$/ && raw > 0) printf "%.1f", raw / 1000 }')
+          ;;
+      esac
+      [ -z "$t" ] && resp=$(at_cmd "AT+MTSM=1,6") && t=$(echo "$resp" | grep '+MTSM:' | awk -F': ' '{print $2}' | tr -d ' \r\n')
+      [ -z "$t" ] && resp=$(at_cmd "AT+MTSM=1") && t=$(echo "$resp" | grep '+MTSM:' | awk -F': ' '{print $2}' | tr -d ' \r\n')
+      ;;
+    meig)
+      resp=$(at_cmd "AT+TEMP")
+      t=$(echo "$resp" | grep -E 'TEMP: "cpuss-0-usr"' | awk -F'"' '{print $4}' | head -1 | tr -d ' \r\n')
+      ;;
+    foxconn)
+      local model
+      model=$(read_state "modem")
+      case "$model" in *T99W640*|*DP25*) pre="AT+" ;; *) pre="AT^" ;; esac
+      resp=$(at_cmd "${pre}TEMP?")
+      t=$(echo "$resp" | sed -n 's/.*TSENS: \([0-9]*\)C.*/\1/p' | tr -d '\r\n')
+      ;;
+    sierra)
+      resp=$(at_cmd "AT!PCTEMP?")
+      t=$(echo "$resp" | grep -oE 'Temperature: [0-9]+\.[0-9]+' | grep -oE '[0-9]+\.[0-9]+' | head -1 | tr -d '\r\n')
+      ;;
+  esac
+  echo "$t"
+}
+
+# ─── Quectel: AT+QENG="servingcell" ──────────────────────────────────────
+query_quectel() {
+  local response ca_response
+  response=$(at_cmd 'AT+QENG="servingcell"')
+  ca_response=$(at_cmd "AT+QCAINFO")
+  parse_quectel_lte_scc "$ca_response"
+
+  local raw_lte_line lte_line nr_nsa_line nr_sa_line
+  # Quectel exposes LTE in two layouts. USB and some PCIe firmware use a
+  # standalone +QENG: "LTE" line, while other PCIe firmware embeds LTE in
+  # the +QENG: "servingcell",<state>,"LTE" line. Remove the two wrapper
+  # fields from the combined form so both layouts share one field map.
+  raw_lte_line=$(echo "$response" | grep -E '^\+QENG: "LTE"|^\+QENG: "servingcell","[^"]*","LTE"' | head -1)
+  lte_line=$(echo "$raw_lte_line" | sed 's/^+QENG: "servingcell","[^"]*",//')
+  nr_nsa_line=$(echo "$response" | grep '+QENG: "NR5G-NSA"' | head -1)
+  nr_sa_line=$(echo "$response" | grep '+QENG: "NR5G-SA"' | head -1)
+
+  local network_mode="" rsrp="" rsrq="" sinr="" rssi=""
+  local band="" cell_id="" pci="" earfcn="" mcc="" mnc="" tac=""
+  local bandwidth="" nr_bandwidth=""
+  local nr_rsrp="" nr_rsrq="" nr_sinr="" nr_band="" nr_pci="" nr_earfcn=""
+
+  if [ -n "$nr_sa_line" ]; then
+    network_mode="NR5G-SA"
+    mcc=$(echo "$nr_sa_line" | awk -F',' '{print $5}')
+    mnc=$(echo "$nr_sa_line" | awk -F',' '{print $6}')
+    cell_id=$(echo "$nr_sa_line" | awk -F',' '{print $7}')
+    pci=$(echo "$nr_sa_line" | awk -F',' '{print $8}')
+    tac=$(echo "$nr_sa_line" | awk -F',' '{print $9}')
+    earfcn=$(echo "$nr_sa_line" | awk -F',' '{print $10}')
+    band=$(echo "$nr_sa_line" | awk -F',' '{print $11}')
+    local bw_idx
+    bw_idx=$(echo "$nr_sa_line" | awk -F',' '{print $12}' | tr -d '\r\n')
+    bandwidth=$(get_bandwidth NR "$bw_idx")
+    rsrp=$(echo "$nr_sa_line" | awk -F',' '{print $13}')
+    rsrq=$(echo "$nr_sa_line" | awk -F',' '{print $14}')
+    sinr=$(echo "$nr_sa_line" | awk -F',' '{print $15}')
+  elif [ -n "$lte_line" ]; then
+    if [ -n "$nr_nsa_line" ]; then
+      network_mode="EN-DC"
+    else
+      network_mode="LTE"
+    fi
+
+    # Normalized LTE field map: RAT,duplex,MCC,MNC,cell ID,PCI,EARFCN,band,
+    # UL bandwidth,DL bandwidth,TAC,RSRP,RSRQ,RSSI,SINR,...
+    mcc=$(echo "$lte_line" | awk -F',' '{print $3}')
+    mnc=$(echo "$lte_line" | awk -F',' '{print $4}')
+    cell_id=$(echo "$lte_line" | awk -F',' '{print $5}')
+    pci=$(echo "$lte_line" | awk -F',' '{print $6}')
+    earfcn=$(echo "$lte_line" | awk -F',' '{print $7}')
+    band=$(echo "$lte_line" | awk -F',' '{print $8}')
+    local bw_idx nr_bw_idx
+    bw_idx=$(echo "$lte_line" | awk -F',' '{print $10}' | tr -d '\r\n')
+    bandwidth=$(get_bandwidth LTE "$bw_idx")
+    tac=$(echo "$lte_line" | awk -F',' '{print $11}')
+    rsrp=$(echo "$lte_line" | awk -F',' '{print $12}')
+    rsrq=$(echo "$lte_line" | awk -F',' '{print $13}')
+    rssi=$(echo "$lte_line" | awk -F',' '{print $14}')
+    sinr=$(echo "$lte_line" | awk -F',' '{print $15}')
+
+    if [ -n "$nr_nsa_line" ]; then
+      nr_pci=$(echo "$nr_nsa_line" | awk -F',' '{print $4}')
+      nr_rsrp=$(echo "$nr_nsa_line" | awk -F',' '{print $5}')
+      nr_sinr=$(echo "$nr_nsa_line" | awk -F',' '{print $6}')
+      nr_rsrq=$(echo "$nr_nsa_line" | awk -F',' '{print $7}')
+      nr_earfcn=$(echo "$nr_nsa_line" | awk -F',' '{print $8}')
+      nr_band=$(echo "$nr_nsa_line" | awk -F',' '{print $9}')
+      nr_bw_idx=$(echo "$nr_nsa_line" | awk -F',' '{print $10}' | tr -d '\r\n')
+      nr_bandwidth=$(get_bandwidth NR "$nr_bw_idx")
+    fi
+  fi
+
+  # RSSI fallback via AT+CSQ
+  if [ -z "$rssi" ]; then
+    local csq_raw csq_num
+    csq_raw=$(at_cmd "AT+CSQ" | grep "+CSQ:")
+    csq_num=$(echo "$csq_raw" | awk -F'[:,]' '{print $2}' | tr -d ' ')
+    rssi=$(csq_to_rssi "$csq_num")
+  fi
+
+  # Clean up CR/LF
+  rsrp=$(echo "$rsrp" | tr -d '\r\n')
+  rsrq=$(echo "$rsrq" | tr -d '\r\n')
+  sinr=$(echo "$sinr" | tr -d '\r\n')
+  rssi=$(echo "$rssi" | tr -d '\r\n')
+  band=$(echo "$band" | tr -d '\r\n')
+  # QENG Cell ID is hexadecimal, even when it happens to contain only digits.
+  cell_id=$(hex_cell_id_to_decimal "$cell_id")
+  pci=$(echo "$pci" | tr -d '\r\n')
+  earfcn=$(echo "$earfcn" | tr -d '\r\n')
+  mcc=$(echo "$mcc" | tr -d '\r\n')
+  mnc=$(echo "$mnc" | tr -d '\r\n')
+  tac=$(echo "$tac" | tr -d '\r\n')
+  nr_rsrp=$(echo "$nr_rsrp" | tr -d '\r\n')
+  nr_rsrq=$(echo "$nr_rsrq" | tr -d '\r\n')
+  nr_sinr=$(echo "$nr_sinr" | tr -d '\r\n')
+  nr_band=$(echo "$nr_band" | tr -d '\r\n')
+  nr_pci=$(echo "$nr_pci" | tr -d '\r\n')
+  nr_earfcn=$(echo "$nr_earfcn" | tr -d '\r\n')
+
+  write_output "$network_mode" "$rsrp" "$rsrq" "$sinr" "$rssi" "$band" "$cell_id" "$pci" "$earfcn" "$mcc" "$mnc" "$tac" "$nr_rsrp" "$nr_rsrq" "$nr_sinr" "$nr_band" "$nr_pci" "$nr_earfcn" "$bandwidth" "$nr_bandwidth" "$OPERATOR"
+}
+
+# ─── Fibocom GTCCINFO band decoding ──────────────────────────────────────
+# Fibocom Qualcomm encodes bands: LTE 101→1 128→28; NR 5077→77 5041→41
+fibocom_decode_band() {
+  local raw="$1" rat="$2"
+  [ -z "$raw" ] && return
+  case "$rat" in
+    NR*)  # NR: strip "50" prefix (5077→77, 5041→41)
+      case "$raw" in 50??) echo "${raw#50}" ;; *) echo "$raw" ;; esac
+      ;;
+    LTE*)  # LTE: subtract 100 (101→1, 128→28)
+      if [ "$raw" -gt 100 ] 2>/dev/null; then
+        echo $((raw - 100))
+      else
+        echo "$raw"
+      fi
+      ;;
+    *) echo "$raw" ;;
+  esac
+}
+
+# ─── Fibocom GTCCINFO bandwidth decoding ─────────────────────────────────
+# LTE: RB number → MHz (6→1.4, 15→3, 25→5, 50→10, 75→15, 100→20)
+# NR:  direct MHz (0→5, 10/15/.../400 passthrough)
+fibocom_get_bandwidth() {
+  local net="$1" n="$2" fm350="${3:-0}"
+  [ -z "$n" ] || ! echo "$n" | grep -q '^[0-9]*$' && return
+  case "$net" in
+    LTE)
+      case "$n" in
+        0|6) echo "1.4" ;; 1|15) echo "3" ;; 2|25) echo "5" ;;
+        3) echo "10" ;; 4) echo "15" ;; 5) echo "20" ;;
+        50) echo "10" ;; 75) echo "15" ;; 100) echo "20" ;;
+      esac ;;
+    NR)
+      if [ "$fm350" = "1" ]; then
+        # FM350/MediaTek reports either an NR bandwidth index or a value in
+        # 0.2 MHz units (for example, 500 means 100 MHz).
+        case "$n" in
+          0) echo "5" ;; 1) echo "10" ;; 2) echo "15" ;; 3) echo "20" ;;
+          4) echo "25" ;; 5) echo "30" ;; 6) echo "40" ;; 7) echo "50" ;;
+          8) echo "60" ;; 9) echo "70" ;; 10) echo "80" ;; 11) echo "90" ;;
+          12) echo "100" ;;
+          25|50|75|100|125|150|200|250|300|400|500) echo $((n / 5)) ;;
+        esac
+      else
+        case "$n" in
+          0) echo "5" ;;
+          10|15|20|25|30|40|50|60|80|90|100|200|400) echo "$n" ;;
+        esac
+      fi
+      ;;
+  esac
+}
+
+# ─── Fibocom: AT+GTCCINFO? + AT+CSQ ─────────────────────────────────────
+query_fibocom() {
+  local response ca_response cops_response rat="" network_mode="" fm350=0
+  fibocom_is_fm350 && fm350=1
+  response=$(at_cmd "AT+GTCCINFO?")
+  ca_response=$(at_cmd "AT+GTCAINFO?")
+  parse_fibocom_lte_scc "$ca_response"
+
+  # Select serving rows (field 1 = 1) before neighbour rows (field 1 = 2).
+  # Older firmware without the serving marker retains the numeric fallback.
+  local lte_line nr_line cell_line
+  lte_line=$(echo "$response" | grep -E '^1,4,' | head -1)
+  nr_line=$(echo "$response" | grep -E '^1,9,' | head -1)
+  [ -z "$lte_line" ] && lte_line=$(echo "$response" | grep -E '^[0-9]+,4,' | head -1)
+  [ -z "$nr_line" ] && nr_line=$(echo "$response" | grep -E '^[0-9]+,9,' | head -1)
+  cell_line="${lte_line:-$nr_line}"
+  [ -z "$cell_line" ] && cell_line=$(echo "$response" | grep -E '^[0-9]+,' | head -1)
+
+  # Determine RAT
+  rat=$(echo "$response" | grep "service" | awk '{print $1}' | head -1)
+  if [ -z "$rat" ]; then
+    if [ -n "$lte_line" ] && [ -n "$nr_line" ]; then
+      rat="LTE-NR"
+    elif [ -n "$nr_line" ]; then
+      rat="NR"
+    elif [ -n "$lte_line" ]; then
+      rat="LTE"
+    fi
+  fi
+  if [ -z "$rat" ]; then
+    local rat_num
+    cops_response=$(at_cmd "AT+COPS?")
+    rat_num=$(echo "$cops_response" | grep "+COPS:" | awk -F',' '{print $4}' | tr -d ' \r\n')
+    case "$rat_num" in
+      0|3) rat="GSM" ;;
+      2|5) rat="UMTS" ;;
+      6|7) rat="LTE" ;;
+      11) rat="NR" ;;
+      12) rat="LTE-NR" ;;
+      *) rat="" ;;
+    esac
+  fi
+
+  local rsrp="" rsrq="" sinr="" rssi=""
+  local band="" cell_id="" pci="" earfcn="" mcc="" mnc="" tac="" bandwidth="" nr_bandwidth=""
+  local nr_rsrp="" nr_rsrq="" nr_sinr="" nr_band="" nr_pci="" nr_earfcn=""
+
+  if [ -n "$lte_line" ] || [ -n "$cell_line" ]; then
+    case "$rat" in
+      NR|NR5G)
+        network_mode="NR5G-SA"
+        local line="${cell_line}"
+        mcc=$(echo "$line" | awk -F',' '{print $3}' | tr -d '\r\n')
+        mnc=$(echo "$line" | awk -F',' '{print $4}' | tr -d '\r\n')
+        tac=$(printf "%d" "0x$(echo "$line" | awk -F',' '{print $5}' | tr -d '\r\n')" 2>/dev/null)
+        cell_id=$(printf "%d" "0x$(echo "$line" | awk -F',' '{print $6}' | tr -d '\r\n')" 2>/dev/null)
+        earfcn=$(fibocom_channel_or_pci "$(echo "$line" | awk -F',' '{print $7}')" "$fm350")
+        pci=$(fibocom_channel_or_pci "$(echo "$line" | awk -F',' '{print $8}')" "$fm350")
+        band=$(fibocom_decode_band "$(echo "$line" | awk -F',' '{print $9}' | tr -d '\r\n')" "NR")
+        bandwidth=$(fibocom_get_bandwidth NR "$(echo "$line" | awk -F',' '{print $10}' | tr -d '\r\n')" "$fm350")
+        local sinr_raw rsrp_raw rsrq_raw
+        sinr_raw=$(echo "$line" | awk -F',' '{print $11}' | tr -d '\r\n')
+        rsrp_raw=$(echo "$line" | awk -F',' '{print $13}' | tr -d '\r\n')
+        rsrq_raw=$(echo "$line" | awk -F',' '{print $14}' | tr -d '\r\n')
+        [ -n "$rsrp_raw" ] && rsrp=$((rsrp_raw - 157))
+        [ -n "$rsrq_raw" ] && rsrq=$(awk "BEGIN{printf \"%.1f\", ($rsrq_raw+1)*0.5-44}")
+        if [ -n "$sinr_raw" ]; then
+          [ "$fm350" = "1" ] && sinr="$sinr_raw" || sinr=$(awk "BEGIN{printf \"%.1f\", $sinr_raw*0.5-23.5}")
+        fi
+        ;;
+      LTE-NR)
+        network_mode="EN-DC"
+        # LTE primary cell
+        local line="${lte_line}"
+        mcc=$(echo "$line" | awk -F',' '{print $3}' | tr -d '\r\n')
+        mnc=$(echo "$line" | awk -F',' '{print $4}' | tr -d '\r\n')
+        tac=$(printf "%d" "0x$(echo "$line" | awk -F',' '{print $5}' | tr -d '\r\n')" 2>/dev/null)
+        cell_id=$(printf "%d" "0x$(echo "$line" | awk -F',' '{print $6}' | tr -d '\r\n')" 2>/dev/null)
+        earfcn=$(fibocom_channel_or_pci "$(echo "$line" | awk -F',' '{print $7}')" "$fm350")
+        pci=$(fibocom_channel_or_pci "$(echo "$line" | awk -F',' '{print $8}')" "$fm350")
+        band=$(fibocom_decode_band "$(echo "$line" | awk -F',' '{print $9}' | tr -d '\r\n')" "LTE")
+        bandwidth=$(fibocom_get_bandwidth LTE "$(echo "$line" | awk -F',' '{print $10}' | tr -d '\r\n')")
+        local sinr_raw rsrp_raw rsrq_raw
+        sinr_raw=$(echo "$line" | awk -F',' '{print $11}' | tr -d '\r\n')
+        rsrp_raw=$(echo "$line" | awk -F',' '{print $13}' | tr -d '\r\n')
+        rsrq_raw=$(echo "$line" | awk -F',' '{print $14}' | tr -d '\r\n')
+        rsrp=$(fibocom_lte_rsrp "$rsrp_raw")
+        [ -n "$rsrq_raw" ] && rsrq=$(awk "BEGIN{printf \"%.1f\", $rsrq_raw*0.5-20}")
+        if [ -n "$sinr_raw" ]; then
+          [ "$fm350" = "1" ] && sinr="$sinr_raw" || sinr=$(awk "BEGIN{printf \"%.1f\", $sinr_raw*0.5}")
+        fi
+        # NR secondary cell
+        if [ -n "$nr_line" ]; then
+          nr_band=$(fibocom_decode_band "$(echo "$nr_line" | awk -F',' '{print $9}' | tr -d '\r\n')" "NR")
+          nr_bandwidth=$(fibocom_get_bandwidth NR "$(echo "$nr_line" | awk -F',' '{print $10}' | tr -d '\r\n')" "$fm350")
+          nr_earfcn=$(fibocom_channel_or_pci "$(echo "$nr_line" | awk -F',' '{print $7}')" "$fm350")
+          nr_pci=$(fibocom_channel_or_pci "$(echo "$nr_line" | awk -F',' '{print $8}')" "$fm350")
+          local nr_sinr_raw nr_rsrp_raw nr_rsrq_raw
+          nr_sinr_raw=$(echo "$nr_line" | awk -F',' '{print $11}' | tr -d '\r\n')
+          nr_rsrp_raw=$(echo "$nr_line" | awk -F',' '{print $13}' | tr -d '\r\n')
+          nr_rsrq_raw=$(echo "$nr_line" | awk -F',' '{print $14}' | tr -d '\r\n')
+          [ -n "$nr_rsrp_raw" ] && nr_rsrp=$((nr_rsrp_raw - 157))
+          [ -n "$nr_rsrq_raw" ] && nr_rsrq=$(awk "BEGIN{printf \"%.1f\", ($nr_rsrq_raw+1)*0.5-44}")
+          if [ -n "$nr_sinr_raw" ]; then
+            [ "$fm350" = "1" ] && nr_sinr="$nr_sinr_raw" || nr_sinr=$(awk "BEGIN{printf \"%.1f\", $nr_sinr_raw*0.5-23.5}")
+          fi
+        fi
+        ;;
+      LTE)
+        network_mode="LTE"
+        local line="${lte_line:-$cell_line}"
+        mcc=$(echo "$line" | awk -F',' '{print $3}' | tr -d '\r\n')
+        mnc=$(echo "$line" | awk -F',' '{print $4}' | tr -d '\r\n')
+        tac=$(printf "%d" "0x$(echo "$line" | awk -F',' '{print $5}' | tr -d '\r\n')" 2>/dev/null)
+        cell_id=$(printf "%d" "0x$(echo "$line" | awk -F',' '{print $6}' | tr -d '\r\n')" 2>/dev/null)
+        earfcn=$(fibocom_channel_or_pci "$(echo "$line" | awk -F',' '{print $7}')" "$fm350")
+        pci=$(fibocom_channel_or_pci "$(echo "$line" | awk -F',' '{print $8}')" "$fm350")
+        band=$(fibocom_decode_band "$(echo "$line" | awk -F',' '{print $9}' | tr -d '\r\n')" "LTE")
+        bandwidth=$(fibocom_get_bandwidth LTE "$(echo "$line" | awk -F',' '{print $10}' | tr -d '\r\n')")
+        local sinr_raw rsrp_raw rsrq_raw
+        sinr_raw=$(echo "$line" | awk -F',' '{print $11}' | tr -d '\r\n')
+        rsrp_raw=$(echo "$line" | awk -F',' '{print $13}' | tr -d '\r\n')
+        rsrq_raw=$(echo "$line" | awk -F',' '{print $14}' | tr -d '\r\n')
+        rsrp=$(fibocom_lte_rsrp "$rsrp_raw")
+        [ -n "$rsrq_raw" ] && rsrq=$(awk "BEGIN{printf \"%.1f\", $rsrq_raw*0.5-20}")
+        if [ -n "$sinr_raw" ]; then
+          [ "$fm350" = "1" ] && sinr="$sinr_raw" || sinr=$(awk "BEGIN{printf \"%.1f\", $sinr_raw*0.5}")
+        fi
+        ;;
+      UMTS|WCDMA)
+        network_mode="WCDMA"
+        local line="${cell_line}"
+        mcc=$(echo "$line" | awk -F',' '{print $3}' | tr -d '\r\n')
+        mnc=$(echo "$line" | awk -F',' '{print $4}' | tr -d '\r\n')
+        ;;
+      *)
+        network_mode="$rat"
+        ;;
+    esac
+  fi
+
+  # RSSI via AT+CSQ
+  local csq_raw csq_num
+  csq_raw=$(at_cmd "AT+CSQ" | grep "+CSQ:")
+  csq_num=$(echo "$csq_raw" | awk -F'[:,]' '{print $2}' | tr -d ' ')
+  rssi=$(csq_to_rssi "$csq_num")
+
+  write_output "$network_mode" "$rsrp" "$rsrq" "$sinr" "$rssi" "$band" "$cell_id" "$pci" "$earfcn" "$mcc" "$mnc" "$tac" "$nr_rsrp" "$nr_rsrq" "$nr_sinr" "$nr_band" "$nr_pci" "$nr_earfcn" "$bandwidth" "$nr_bandwidth" "$OPERATOR"
+}
+
+# ─── Sierra: AT!GSTATUS? + AT!LTEINFO? + AT!NRINFO? ──────────────────────
+query_sierra() {
+  local gstatus lteinfo nrinfo
+  gstatus=$(at_cmd "AT!GSTATUS?")
+  lteinfo=$(at_cmd "AT!LTEINFO?")
+  nrinfo=$(at_cmd "AT!NRINFO?")
+
+  local network_mode="" rsrp="" rsrq="" sinr="" rssi=""
+  local band="" cell_id="" pci="" earfcn="" mcc="" mnc="" tac="" bandwidth=""
+  local nr_rsrp="" nr_rsrq="" nr_sinr="" nr_band="" nr_pci="" nr_earfcn="" nr_bandwidth=""
+  local raw_mode serving_line bw_idx
+
+  raw_mode=$(echo "$gstatus" | sed -n 's/.*System mode:[[:space:]]*\([^[:space:]]*\).*/\1/p' | head -1 | tr -d '\r\n')
+  case "$raw_mode" in
+    ENDC|EN-DC|LTE-NR|LTE_NR) network_mode="EN-DC" ;;
+    NR5G|NR5G-SA|NR5G_SA|5G) network_mode="NR5G-SA" ;;
+    *) network_mode="$raw_mode" ;;
+  esac
+
+  # The numeric serving row is stable and avoids GSTATUS lines containing
+  # two key:value pairs. Fields follow the AT!LTEINFO? header order.
+  serving_line=$(echo "$lteinfo" | awk '
+    /^Serving:/ { serving=1; next }
+    serving && /^[[:space:]]*[0-9]+[[:space:]]/ { print; exit }
+  ')
+  if [ -n "$serving_line" ]; then
+    earfcn=$(echo "$serving_line" | awk '{print $1}')
+    mcc=$(echo "$serving_line" | awk '{print $2}')
+    mnc=$(echo "$serving_line" | awk '{print $3}')
+    tac=$(echo "$serving_line" | awk '{print $4}')
+    cell_id=$(echo "$serving_line" | awk '{print $5}')
+    band=$(echo "$serving_line" | awk '{print $6}')
+    bw_idx=$(echo "$serving_line" | awk '{print $7}')
+    bandwidth=$(get_bandwidth LTE "$bw_idx")
+    sinr=$(echo "$serving_line" | awk '{print $9}')
+    pci=$(echo "$serving_line" | awk '{print $10}')
+    rsrq=$(echo "$serving_line" | awk '{print $11}')
+    rsrp=$(echo "$serving_line" | awk '{print $12}')
+    rssi=$(echo "$serving_line" | awk '{print $13}')
+  else
+    # Precise GSTATUS fallback for firmware without LTEINFO serving rows.
+    band=$(echo "$gstatus" | sed -n 's/.*LTE band:[[:space:]]*\([^[:space:]]*\).*/\1/p' | head -1)
+    bandwidth=$(echo "$gstatus" | sed -n 's/.*LTE bw:[[:space:]]*\([0-9.]*\)[[:space:]]*MHz.*/\1/p' | head -1)
+    earfcn=$(echo "$gstatus" | sed -n 's/.*LTE Rx chan:[[:space:]]*\([0-9]*\).*/\1/p' | head -1)
+    rssi=$(echo "$gstatus" | sed -n 's/.*PCC Rx0 RSSI:[[:space:]]*\(-\{0,1\}[0-9.]*\).*/\1/p' | head -1)
+    rsrp=$(echo "$gstatus" | sed -n 's/.*PCC Rx0 RSRP:[[:space:]]*\(-\{0,1\}[0-9.]*\).*/\1/p' | head -1)
+    rsrq=$(echo "$gstatus" | sed -n 's/.*RSRQ (dB):[[:space:]]*\(-\{0,1\}[0-9.]*\).*/\1/p' | head -1)
+    sinr=$(echo "$gstatus" | sed -n 's/.*SINR (dB):[[:space:]]*\(-\{0,1\}[0-9.]*\).*/\1/p' | head -1)
+    cell_id=$(echo "$gstatus" | sed -n 's/.*Cell ID:[[:space:]]*\([^[:space:]]*\).*/\1/p' | head -1)
+    tac=$(echo "$gstatus" | sed -n 's/.*TAC:[[:space:]]*[0-9A-Fa-f]*[[:space:]]*(\([0-9]*\)).*/\1/p' | head -1)
+  fi
+
+  # NRINFO is authoritative for the NSA/SA NR carrier and signal metrics.
+  nr_band=$(echo "$nrinfo" | sed -n 's/.*NR5G band:[[:space:]]*[nN]\{0,1\}\([0-9]*\).*/\1/p' | head -1)
+  nr_bandwidth=$(echo "$nrinfo" | sed -n 's/.*NR5G dl bw:[[:space:]]*\([0-9.]*\)[[:space:]]*MHz.*/\1/p' | head -1)
+  nr_earfcn=$(echo "$nrinfo" | sed -n 's/.*NR5G Rx chan:[[:space:]]*\([0-9]*\).*/\1/p' | head -1)
+  nr_rsrp=$(echo "$nrinfo" | sed -n 's/.*NR5G RSRP (dBm):[[:space:]]*\(-\{0,1\}[0-9.]*\).*/\1/p' | head -1)
+  nr_rsrq=$(echo "$nrinfo" | sed -n 's/.*NR5G RSRQ (dB):[[:space:]]*\(-\{0,1\}[0-9.]*\).*/\1/p' | head -1)
+  nr_sinr=$(echo "$nrinfo" | sed -n 's/.*NR5G SINR (dB):[[:space:]]*\(-\{0,1\}[0-9.]*\).*/\1/p' | head -1)
+
+  if [ -z "$nr_band" ]; then
+    nr_band=$(echo "$gstatus" | sed -n 's/.*SCC[0-9]* NR5G band:[[:space:]]*[nN]\{0,1\}\([0-9]*\).*/\1/p' | head -1)
+    nr_bandwidth=$(echo "$gstatus" | sed -n 's/.*SCC[0-9]* NR5G bw:[[:space:]]*\([0-9.]*\)[[:space:]]*MHz.*/\1/p' | head -1)
+    nr_earfcn=$(echo "$gstatus" | sed -n 's/.*SCC[0-9]* NR5G Rx chan:[[:space:]]*\([0-9]*\).*/\1/p' | head -1)
+    nr_rsrp=$(echo "$gstatus" | sed -n 's/.*NR5G RSRP (dBm):[[:space:]]*\(-\{0,1\}[0-9.]*\).*/\1/p' | head -1)
+    nr_rsrq=$(echo "$gstatus" | sed -n 's/.*NR5G RSRQ (dB):[[:space:]]*\(-\{0,1\}[0-9.]*\).*/\1/p' | head -1)
+    nr_sinr=$(echo "$gstatus" | sed -n 's/.*NR5G SINR (dB):[[:space:]]*\(-\{0,1\}[0-9.]*\).*/\1/p' | head -1)
+  fi
+
+  [ -z "$network_mode" ] && [ -n "$nr_band" ] && network_mode="EN-DC"
+
+  if [ -z "$rssi" ]; then
+    local csq_raw csq_num
+    csq_raw=$(at_cmd "AT+CSQ" | grep "+CSQ:")
+    csq_num=$(echo "$csq_raw" | awk -F'[:,]' '{print $2}' | tr -d ' ')
+    rssi=$(csq_to_rssi "$csq_num")
+  fi
+
+  # Sierra LTEINFO/GSTATUS CID is hexadecimal; expose decimal consistently.
+  cell_id=$(hex_cell_id_to_decimal "$cell_id")
+
+  write_output "$network_mode" "$rsrp" "$rsrq" "$sinr" "$rssi" "$band" "$cell_id" "$pci" "$earfcn" "$mcc" "$mnc" "$tac" "$nr_rsrp" "$nr_rsrq" "$nr_sinr" "$nr_band" "$nr_pci" "$nr_earfcn" "$bandwidth" "$nr_bandwidth" "$OPERATOR"
+}
+
+# ─── Meig: AT+SGCELLINFOEX? / AT+CELLINFO=1 / AT^CELLINFO=1 ──────────────
+query_meig() {
+  local network_mode="" rsrp="" rsrq="" sinr="" rssi=""
+  local band="" cell_id="" pci="" earfcn="" mcc="" mnc="" tac="" bandwidth="" nr_bandwidth=""
+  local nr_rsrp="" nr_rsrq="" nr_sinr="" nr_band="" nr_pci="" nr_earfcn=""
+
+  # Carrier aggregation is reported separately from serving-cell data.
+  local ca_response
+  ca_response=$(at_cmd "AT^CELLINFO=3")
+  if ! echo "$ca_response" | grep -q 'CELLINFO:.*"SCC"'; then
+    ca_response=$(at_cmd "AT+CELLINFO=3")
+  fi
+  parse_meig_lte_scc "$ca_response"
+
+  # ── Primary: AT+SGCELLINFOEX? (key:value, robust) ────────────────────────
+  local sgex
+  sgex=$(at_cmd "AT+SGCELLINFOEX?")
+  local sgex_mode
+  sgex_mode=$(echo "$sgex" | grep '^CURR_MODE:' | awk -F':' '{print $2}' | tr -d ' \r\n')
+
+  if [ -n "$sgex_mode" ]; then
+    case "$sgex_mode" in
+      EN-DC)         network_mode="EN-DC" ;;
+      NR5G_SA|NR5GSA) network_mode="NR5G-SA" ;;
+      LTE)           network_mode="LTE" ;;
+      WCDMA|UMTS)    network_mode="WCDMA" ;;
+      *)             network_mode="$sgex_mode" ;;
+    esac
+
+    mcc=$(echo "$sgex" | grep '^MCC:' | awk -F':' '{print $2}' | tr -d ' \r\n')
+    mnc=$(echo "$sgex" | grep '^MNC:' | awk -F':' '{print $2}' | tr -d ' \r\n')
+    cell_id=$(echo "$sgex" | grep '^PCELL CELL_ID:' | awk -F':' '{print $2}' | tr -d ' \r\n')
+    pci=$(echo "$sgex" | grep '^PCELL PHYSICAL_CELL_ID:' | awk -F':' '{print $2}' | tr -d ' \r\n')
+    tac=$(echo "$sgex" | grep '^PCELL TAC_ID:' | awk -F':' '{print $2}' | tr -d ' \r\n')
+    band=$(echo "$sgex" | grep '^PCELL BAND:' | awk -F':' '{print $2}' | tr -d ' \r\n')
+    earfcn=$(echo "$sgex" | grep '^PCELL DL CHANNEL:' | awk -F':' '{print $2}' | tr -d ' \r\n')
+    rssi=$(echo "$sgex" | grep '^PCELL RSSI:' | awk -F':' '{print $2}' | tr -d ' \r\n')
+    rsrp=$(echo "$sgex" | grep '^PCELL RSRP:' | awk -F':' '{print $2}' | tr -d ' \r\n')
+    rsrq=$(echo "$sgex" | grep '^PCELL RSRQ:' | awk -F':' '{print $2}' | tr -d ' \r\n')
+    local sinr_raw
+    sinr_raw=$(echo "$sgex" | grep '^PCELL SINR:' | awk -F':' '{print $2}' | tr -d ' \r\n')
+    if [ -n "$sinr_raw" ] && echo "$sinr_raw" | grep -q '^[0-9.-]*$'; then
+      sinr=$(awk "BEGIN{printf \"%.1f\", $sinr_raw/10}" 2>/dev/null)
+    fi
+
+    # Bandwidth (raw value is 5x real MHz; 6→1.4MHz edge case)
+    bandwidth=$(echo "$sgex" | grep '^PCELL BANDWIDTH:' | awk -F':' '{print $2}' | tr -d ' \r\n')
+    [ "$bandwidth" = "6" ] && bandwidth="1.4" || bandwidth=$((bandwidth / 5))
+
+    # Parse 5G NR (PSCELL) fields — only present in EN-DC mode
+    if [ "$network_mode" = "EN-DC" ]; then
+      nr_rsrp=$(echo "$sgex" | grep '^PSCELL RSRP:' | awk -F':' '{print $2}' | tr -d ' \r\n')
+      nr_rsrq=$(echo "$sgex" | grep '^PSCELL RSRQ:' | awk -F':' '{print $2}' | tr -d ' \r\n')
+      nr_band=$(echo "$sgex" | grep '^PSCELL BAND:' | awk -F':' '{print $2}' | tr -d ' \r\n')
+      nr_pci=$(echo "$sgex" | grep '^PSCELL PCI:' | awk -F':' '{print $2}' | tr -d ' \r\n')
+      nr_earfcn=$(echo "$sgex" | grep '^PSCELL FREQ:' | awk -F':' '{print $2}' | tr -d ' \r\n')
+      local nr_sinr_raw
+      nr_sinr_raw=$(echo "$sgex" | grep '^PSCELL SINR:' | awk -F':' '{print $2}' | tr -d ' \r\n')
+      if [ -n "$nr_sinr_raw" ] && echo "$nr_sinr_raw" | grep -q '^[0-9.-]*$'; then
+        nr_sinr=$(awk "BEGIN{printf \"%.1f\", $nr_sinr_raw/10}" 2>/dev/null)
+      fi
+      # NR bandwidth
+      nr_bandwidth=$(echo "$sgex" | grep '^PSCELL BANDWIDTH:' | awk -F':' '{print $2}' | tr -d ' \r\n' | sed 's/MHz//')
+    fi
+
+    write_output "$network_mode" "$rsrp" "$rsrq" "$sinr" "$rssi" "$band" "$cell_id" "$pci" "$earfcn" "$mcc" "$mnc" "$tac" "$nr_rsrp" "$nr_rsrq" "$nr_sinr" "$nr_band" "$nr_pci" "$nr_earfcn" "$bandwidth" "$nr_bandwidth" "$OPERATOR"
+    return
+  fi
+
+  # ── Fallback: AT+CELLINFO=1 (plus prefix) ────────────────────────────────
+  local response cellinfo data
+  response=$(at_cmd "AT+CELLINFO=1")
+  cellinfo=$(echo "$response" | grep '+CELLINFO:')
+
+  # ── Last-resort: AT^CELLINFO=1 (caret prefix) ───────────────────────────
+  if [ -z "$cellinfo" ]; then
+    response=$(at_cmd "AT^CELLINFO=1")
+    cellinfo=$(echo "$response" | grep 'CELLINFO:')
+  fi
+
+  if [ -n "$cellinfo" ]; then
+    data=$(echo "$cellinfo" | sed 's/.*CELLINFO://')
+    local rat
+    rat=$(echo "$data" | awk -F',' '{print $1}' | tr -d ' \r\n')
+
+    case "$rat" in
+      EN-DC|LTE-NR|LTE_NR)
+        network_mode="EN-DC"
+        mcc=$(echo "$data" | awk -F',' '{print $3}' | tr -d ' ')
+        mnc=$(echo "$data" | awk -F',' '{print $4}' | tr -d ' ')
+        pci=$(echo "$data" | awk -F',' '{print $6}' | tr -d ' ')
+        cell_id=$(echo "$data" | awk -F',' '{print $8}' | tr -d ' ')
+        tac=$(echo "$data" | awk -F',' '{print $9}' | tr -d ' ')
+        band=$(echo "$data" | awk -F',' '{print $10}' | tr -d ' ')
+        earfcn=$(echo "$data" | awk -F',' '{print $12}' | tr -d ' ')
+        rssi=$(echo "$data" | awk -F',' '{print $14}' | tr -d ' ')
+        rsrp=$(echo "$data" | awk -F',' '{print $15}' | tr -d ' ')
+        rsrq=$(echo "$data" | awk -F',' '{print $16}' | tr -d ' ')
+        local sinr_raw
+        sinr_raw=$(echo "$data" | awk -F',' '{print $17}' | tr -d ' ')
+        if [ -n "$sinr_raw" ] && echo "$sinr_raw" | grep -q '^[0-9.-]*$'; then
+          sinr=$(awk "BEGIN{printf \"%.1f\", $sinr_raw/10}" 2>/dev/null)
+        fi
+        # 5G NR (PSCELL) — positions 30-38
+        nr_rsrp=$(echo "$data" | awk -F',' '{print $30}' | tr -d ' ')
+        nr_rsrq=$(echo "$data" | awk -F',' '{print $31}' | tr -d ' ')
+        nr_band=$(echo "$data" | awk -F',' '{print $33}' | tr -d ' ')
+        nr_earfcn=$(echo "$data" | awk -F',' '{print $34}' | tr -d ' ')
+        nr_pci=$(echo "$data" | awk -F',' '{print $36}' | tr -d ' ')
+        local nr_sinr_raw
+        nr_sinr_raw=$(echo "$data" | awk -F',' '{print $32}' | tr -d ' ')
+        if [ -n "$nr_sinr_raw" ] && echo "$nr_sinr_raw" | grep -q '^[0-9.-]*$'; then
+          nr_sinr=$(awk "BEGIN{printf \"%.1f\", $nr_sinr_raw/10}" 2>/dev/null)
+        fi
+        ;;
+      5G|NR|NR5G-SA)
+        network_mode="NR5G-SA"
+        mcc=$(echo "$data" | awk -F',' '{print $3}' | tr -d ' ')
+        mnc=$(echo "$data" | awk -F',' '{print $4}' | tr -d ' ')
+        cell_id=$(echo "$data" | awk -F',' '{print $5}' | tr -d ' ')
+        pci=$(echo "$data" | awk -F',' '{print $6}' | tr -d ' ')
+        tac=$(echo "$data" | awk -F',' '{print $7}' | tr -d ' ')
+        band=$(echo "$data" | awk -F',' '{print $8}' | tr -d ' ')
+        earfcn=$(echo "$data" | awk -F',' '{print $12}' | tr -d ' ')
+        rssi=$(echo "$data" | awk -F',' '{print $14}' | tr -d ' ')
+        rsrp=$(echo "$data" | awk -F',' '{print $15}' | tr -d ' ')
+        rsrq=$(echo "$data" | awk -F',' '{print $16}' | tr -d ' ')
+        local sinr_raw
+        sinr_raw=$(echo "$data" | awk -F',' '{print $17}' | tr -d ' ')
+        if [ -n "$sinr_raw" ] && echo "$sinr_raw" | grep -q '^[0-9.-]*$'; then
+          sinr=$(awk "BEGIN{printf \"%.1f\", $sinr_raw/10}" 2>/dev/null)
+        fi
+        ;;
+      LTE)
+        network_mode="LTE"
+        mcc=$(echo "$data" | awk -F',' '{print $3}' | tr -d ' ')
+        mnc=$(echo "$data" | awk -F',' '{print $4}' | tr -d ' ')
+        pci=$(echo "$data" | awk -F',' '{print $6}' | tr -d ' ')
+        cell_id=$(echo "$data" | awk -F',' '{print $8}' | tr -d ' ')
+        tac=$(echo "$data" | awk -F',' '{print $9}' | tr -d ' ')
+        band=$(echo "$data" | awk -F',' '{print $10}' | tr -d ' ')
+        earfcn=$(echo "$data" | awk -F',' '{print $12}' | tr -d ' ')
+        rssi=$(echo "$data" | awk -F',' '{print $14}' | tr -d ' ')
+        rsrp=$(echo "$data" | awk -F',' '{print $15}' | tr -d ' ')
+        rsrq=$(echo "$data" | awk -F',' '{print $16}' | tr -d ' ')
+        local sinr_raw
+        sinr_raw=$(echo "$data" | awk -F',' '{print $17}' | tr -d ' ')
+        if [ -n "$sinr_raw" ] && echo "$sinr_raw" | grep -q '^[0-9.-]*$'; then
+          sinr=$(awk "BEGIN{printf \"%.1f\", $sinr_raw/10}" 2>/dev/null)
+        fi
+        ;;
+      WCDMA|UMTS)
+        network_mode="WCDMA"
+        ;;
+      *)
+        network_mode="$rat"
+        ;;
+    esac
+  fi
+
+  # RSSI via AT+CSQ (only if not extracted above)
+  if [ -z "$rssi" ]; then
+    local csq_raw csq_num
+    csq_raw=$(at_cmd "AT+CSQ" | grep "+CSQ:")
+    csq_num=$(echo "$csq_raw" | awk -F'[:,]' '{print $2}' | tr -d ' ')
+    rssi=$(csq_to_rssi "$csq_num")
+  fi
+
+  rsrp=$(echo "$rsrp" | tr -d '\r\n')
+  rsrq=$(echo "$rsrq" | tr -d '\r\n')
+  sinr=$(echo "$sinr" | tr -d '\r\n')
+  rssi=$(echo "$rssi" | tr -d '\r\n')
+  band=$(echo "$band" | tr -d '\r\n')
+  cell_id=$(echo "$cell_id" | tr -d '\r\n')
+  pci=$(echo "$pci" | tr -d '\r\n')
+  earfcn=$(echo "$earfcn" | tr -d '\r\n')
+  mcc=$(echo "$mcc" | tr -d '\r\n')
+  mnc=$(echo "$mnc" | tr -d '\r\n')
+  tac=$(echo "$tac" | tr -d '\r\n')
+  nr_rsrp=$(echo "$nr_rsrp" | tr -d '\r\n')
+  nr_rsrq=$(echo "$nr_rsrq" | tr -d '\r\n')
+  nr_sinr=$(echo "$nr_sinr" | tr -d '\r\n')
+  nr_band=$(echo "$nr_band" | tr -d '\r\n')
+  nr_pci=$(echo "$nr_pci" | tr -d '\r\n')
+  nr_earfcn=$(echo "$nr_earfcn" | tr -d '\r\n')
+
+  write_output "$network_mode" "$rsrp" "$rsrq" "$sinr" "$rssi" "$band" "$cell_id" "$pci" "$earfcn" "$mcc" "$mnc" "$tac" "$nr_rsrp" "$nr_rsrq" "$nr_sinr" "$nr_band" "$nr_pci" "$nr_earfcn" "$bandwidth" "$nr_bandwidth" "$OPERATOR"
+}
+
+# ─── Foxconn: AT^DEBUG? or AT+DEBUG? ─────────────────────────────────────
+query_foxconn() {
+  local model at_pre response
+  model=$(read_state "modem")
+  case "$model" in
+    *T99W640*|*DP25*) at_pre="AT+" ;;
+    *) at_pre="AT^" ;;
+  esac
+
+  response=$(at_cmd "${at_pre}DEBUG?")
+  parse_foxconn_lte_scc "$response"
+
+  local network_mode="" rsrp="" rsrq="" sinr="" rssi=""
+  local band="" cell_id="" pci="" earfcn="" mcc="" mnc="" tac="" bandwidth=""
+  local nr_rsrp="" nr_rsrq="" nr_sinr="" nr_band="" nr_pci="" nr_earfcn="" nr_bandwidth=""
+
+  # RAT detection
+  local rat
+  rat=$(echo "$response" | grep '^RAT:' | awk -F'RAT:' '{print $2}' | tr -d ' \r\n')
+  case "$rat" in
+    LTE+NR|LTE_NR|EN-DC) network_mode="EN-DC" ;;
+    NR5G_SA|NR5G-SA|NR5GSA) network_mode="NR5G-SA" ;;
+    LTE) network_mode="LTE" ;;
+    *) network_mode=$(echo "$rat" | tr -d '\r\n') ;;
+  esac
+
+  # Common fields (mcc/mnc)
+  mcc=$(echo "$response" | grep -oE 'mcc:[0-9]+' | head -1 | cut -d: -f2 | tr -d '\r\n')
+  mnc=$(echo "$response" | grep -oE 'mnc:[0-9]+' | head -1 | cut -d: -f2 | tr -d '\r\n')
+
+  case "$network_mode" in
+    EN-DC)
+      # LTE primary cell
+      cell_id=$(echo "$response" | grep -oE 'lte_cell_id:[0-9]+' | head -1 | cut -d: -f2 | tr -d '\r\n')
+      tac=$(echo "$response" | grep -oE 'lte_tac:[0-9]+' | head -1 | cut -d: -f2 | tr -d '\r\n')
+      band=$(echo "$response" | grep -oE 'lte_band:[0-9]+' | head -1 | cut -d: -f2 | tr -d '\r\n')
+      bandwidth=$(echo "$response" | grep -oE 'lte_band_width:[0-9.]+' | head -1 | cut -d: -f2 | tr -d '\r\n')
+      earfcn=$(echo "$response" | grep -oE 'channel:[0-9]+' | head -1 | cut -d: -f2 | tr -d '\r\n')
+      pci=$(echo "$response" | grep -oE ' pci:[0-9]+' | head -1 | grep -oE '[0-9]+' | tr -d '\r\n')
+      rsrp=$(echo "$response" | grep -oE 'lte_rsrp:[-0-9.]+' | head -1 | cut -d: -f2 | tr -d '\r\n')
+      rsrq=$(echo "$response" | grep -oE ',rsrq:[-0-9.]+' | head -1 | cut -d: -f2 | tr -d '\r\n')
+      rssi=$(echo "$response" | grep -oE 'lte_rssi:[-0-9.]+' | head -1 | cut -d: -f2 | tr -d '\r\n')
+      sinr=$(echo "$response" | grep -oE 'lte_snr:[-0-9.]+' | head -1 | cut -d: -f2 | tr -d '\r\n')
+      # NR secondary cell
+      nr_band=$(echo "$response" | grep -oE 'nr_band:[a-z]*[0-9]+' | head -1 | cut -d: -f2 | tr -d '\r\n' | sed 's/^[a-z]//')
+      nr_bandwidth=$(echo "$response" | grep -oE 'nr_band_width:[0-9.]+' | head -1 | cut -d: -f2 | tr -d '\r\n')
+      nr_earfcn=$(echo "$response" | grep -oE 'nr_channel:[0-9]+' | head -1 | cut -d: -f2 | tr -d '\r\n')
+      nr_pci=$(echo "$response" | grep -oE 'nr_pci:[0-9]+' | head -1 | cut -d: -f2 | tr -d '\r\n')
+      nr_rsrp=$(echo "$response" | grep -oE 'nr_rsrp:[-0-9.]+' | head -1 | cut -d: -f2 | tr -d '\r\n')
+      nr_rsrq=$(echo "$response" | grep -oE 'nr_rsrq:[-0-9.]+' | head -1 | cut -d: -f2 | tr -d '\r\n')
+      nr_sinr=$(echo "$response" | grep -oE 'nr_snr:[-0-9.]+' | head -1 | cut -d: -f2 | tr -d '\r\n')
+      ;;
+    NR5G-SA)
+      # NR serving cell
+      earfcn=$(echo "$response" | grep -oE 'nr_channel:[0-9]+' | head -1 | cut -d: -f2 | tr -d '\r\n')
+      [ -z "$earfcn" ] && earfcn=$(echo "$response" | grep -oE 'channel:[0-9]+' | head -1 | cut -d: -f2 | tr -d '\r\n')
+      pci=$(echo "$response" | grep -oE 'nr_pci:[0-9]+' | head -1 | cut -d: -f2 | tr -d '\r\n')
+      [ -z "$pci" ] && pci=$(echo "$response" | grep -oE ' pci:[0-9]+' | head -1 | grep -oE '[0-9]+' | tr -d '\r\n')
+      cell_id=$(echo "$response" | grep -oE 'nr_cell_id:[0-9]+' | head -1 | cut -d: -f2 | tr -d '\r\n')
+      band=$(echo "$response" | grep -oE 'nr_band:[a-z]*[0-9]+' | head -1 | cut -d: -f2 | tr -d '\r\n' | sed 's/^[a-z]//')
+      bandwidth=$(echo "$response" | grep -oE 'nr_band_width:[0-9.]+' | head -1 | cut -d: -f2 | tr -d '\r\n')
+      tac=$(echo "$response" | grep -oE 'nr_tac:[0-9]+' | head -1 | cut -d: -f2 | tr -d '\r\n')
+      rsrp=$(echo "$response" | grep -oE 'nr_rsrp:[-0-9.]+' | head -1 | cut -d: -f2 | tr -d '\r\n')
+      rsrq=$(echo "$response" | grep -oE 'nr_rsrq:[-0-9.]+' | head -1 | cut -d: -f2 | tr -d '\r\n')
+      sinr=$(echo "$response" | grep -oE 'nr_snr:[-0-9.]+' | head -1 | cut -d: -f2 | tr -d '\r\n')
+      rssi=$(echo "$response" | grep -oE 'nr_rssi:[-0-9.]+' | head -1 | cut -d: -f2 | tr -d '\r\n')
+      ;;
+    LTE)
+      cell_id=$(echo "$response" | grep -oE 'lte_cell_id:[0-9]+' | head -1 | cut -d: -f2 | tr -d '\r\n')
+      tac=$(echo "$response" | grep -oE 'lte_tac:[0-9]+' | head -1 | cut -d: -f2 | tr -d '\r\n')
+      band=$(echo "$response" | grep -oE 'lte_band:[0-9]+' | head -1 | cut -d: -f2 | tr -d '\r\n')
+      bandwidth=$(echo "$response" | grep -oE 'lte_band_width:[0-9.]+' | head -1 | cut -d: -f2 | tr -d '\r\n')
+      earfcn=$(echo "$response" | grep -oE 'channel:[0-9]+' | head -1 | cut -d: -f2 | tr -d '\r\n')
+      pci=$(echo "$response" | grep -oE ' pci:[0-9]+' | head -1 | grep -oE '[0-9]+' | tr -d '\r\n')
+      rsrp=$(echo "$response" | grep -oE 'lte_rsrp:[-0-9.]+' | head -1 | cut -d: -f2 | tr -d '\r\n')
+      rsrq=$(echo "$response" | grep -oE ',rsrq:[-0-9.]+' | head -1 | cut -d: -f2 | tr -d '\r\n')
+      rssi=$(echo "$response" | grep -oE 'lte_rssi:[-0-9.]+' | head -1 | cut -d: -f2 | tr -d '\r\n')
+      sinr=$(echo "$response" | grep -oE 'lte_snr:[-0-9.]+' | head -1 | cut -d: -f2 | tr -d '\r\n')
+      ;;
+    *)
+      network_mode=$(echo "$network_mode" | tr -d '\r\n')
+      ;;
+  esac
+
+  # RSSI fallback via AT+CSQ
+  if [ -z "$rssi" ]; then
+    local csq_raw csq_num
+    csq_raw=$(at_cmd "AT+CSQ" | grep "+CSQ:")
+    csq_num=$(echo "$csq_raw" | awk -F'[:,]' '{print $2}' | tr -d ' ')
+    rssi=$(csq_to_rssi "$csq_num")
+  fi
+
+  write_output "$network_mode" "$rsrp" "$rsrq" "$sinr" "$rssi" "$band" "$cell_id" "$pci" "$earfcn" "$mcc" "$mnc" "$tac" "$nr_rsrp" "$nr_rsrq" "$nr_sinr" "$nr_band" "$nr_pci" "$nr_earfcn" "$bandwidth" "$nr_bandwidth" "$OPERATOR"
+}
+
+# ─── Generic fallback: AT+CSQ only ────────────────────────────────────────
+query_generic() {
+  local csq_raw csq_num rssi=""
+  csq_raw=$(at_cmd "AT+CSQ" | grep "+CSQ:")
+  csq_num=$(echo "$csq_raw" | awk -F'[:,]' '{print $2}' | tr -d ' ')
+  rssi=$(csq_to_rssi "$csq_num")
+
+  write_output "" "" "" "" "$rssi" "" "" "" "" "" "" "" "" "" "" "" "" "" "" "$OPERATOR"
+}
+
+# ─── Write output to file and stdout ─────────────────────────────────────
+write_output() {
+  local network_mode="$1" rsrp="$2" rsrq="$3" sinr="$4" rssi="$5"
+  local band="$6" cell_id="$7" pci="$8" earfcn="$9" mcc="${10}" mnc="${11}" tac="${12}"
+  local nr_rsrp="${13}" nr_rsrq="${14}" nr_sinr="${15}" nr_band="${16}" nr_pci="${17}" nr_earfcn="${18}"
+  local bandwidth="${19}" nr_bandwidth="${20}" operator="${21}"
+  local enodeb_id="" enodeb_id_hex="" cell_number="" cell_number_hex=""
+
+  # All consumers receive a decimal Cell ID.  Vendor parsers with known
+  # digits-only hexadecimal fields convert before reaching this boundary.
+  cell_id=$(normalize_cell_id_decimal "$cell_id")
+
+  # LTE ECI is 28 bits: upper 20 bits are the eNodeB ID and lower 8 bits are
+  # the local cell/sector number.  NR NCI has a different, variable split.
+  case "$network_mode:$cell_id" in
+    LTE:[0-9]*|EN-DC:[0-9]*)
+      if echo "$cell_id" | grep -q '^[0-9][0-9]*$' &&
+         [ "$cell_id" -ge 0 ] 2>/dev/null && [ "$cell_id" -le 268435455 ] 2>/dev/null; then
+        enodeb_id=$(awk -v cid="$cell_id" 'BEGIN { printf "%.0f", int(cid / 256) }')
+        cell_number=$(awk -v cid="$cell_id" 'BEGIN { printf "%.0f", cid - int(cid / 256) * 256 }')
+        enodeb_id_hex=$(printf '%06X' "$enodeb_id" 2>/dev/null)
+        cell_number_hex=$(printf '%02X' "$cell_number" 2>/dev/null)
+      fi
+      ;;
+  esac
+
+  # Prefix LTE band with B, NR band with N (idempotent — skip if already prefixed)
+  case "$network_mode" in
+    NR5G-SA|NR5G_SA|NR5GSA)
+      [ -n "$band" ] && case "$band" in B*|N*|b*|n*) ;; *) band="N$band" ;; esac
+      ;;
+    LTE|EN-DC)
+      [ -n "$band" ] && case "$band" in B*|N*|b*|n*) ;; *) band="B$band" ;; esac
+      ;;
+  esac
+  [ -n "$nr_band" ] && case "$nr_band" in B*|N*|b*|n*) ;; *) nr_band="N$nr_band" ;; esac
+
+  cat > "$SIGNAL_FILE" <<EOF
+network_mode=${network_mode}
+rsrp=${rsrp}
+rsrq=${rsrq}
+sinr=${sinr}
+rssi=${rssi}
+band=${band}
+cell_id=${cell_id}
+enodeb_id=${enodeb_id}
+enodeb_id_hex=${enodeb_id_hex}
+cell_number=${cell_number}
+cell_number_hex=${cell_number_hex}
+pci=${pci}
+earfcn=${earfcn}
+mcc=${mcc}
+mnc=${mnc}
+tac=${tac}
+nr_rsrp=${nr_rsrp}
+nr_rsrq=${nr_rsrq}
+nr_sinr=${nr_sinr}
+nr_band=${nr_band}
+nr_pci=${nr_pci}
+nr_earfcn=${nr_earfcn}
+bandwidth=${bandwidth}
+nr_bandwidth=${nr_bandwidth}
+operator=${operator}
+lte_scc_count=${LTE_SCC_COUNT}
+EOF
+  if [ -n "$LTE_SCC_DATA" ]; then
+    printf '%s\n' "$LTE_SCC_DATA" >> "$SIGNAL_FILE"
+  fi
+  cat "$SIGNAL_FILE"
+}
+
+# ══════════════════════════════════════════════════════════════════════════
+# MAIN
+# ══════════════════════════════════════════════════════════════════════════
+
+AT_TOOL=$(detect_at_tool)
+if [ -z "$AT_TOOL" ]; then
+  echo "ERROR: No AT tool found" >&2
+  exit 1
+fi
+
+if ! acquire_at_lock; then
+  echo "ERROR: AT port busy with another modem request" >&2
+  exit 1
+fi
+
+AT_DEV=$(detect_at_device)
+if [ -z "$AT_DEV" ]; then
+  echo "ERROR: No AT device found" >&2
+  exit 1
+fi
+
+VENDOR=$(detect_vendor)
+
+# Query operator name via AT+COPS? (used by all vendors)
+OPERATOR=$(at_cmd "AT+COPS?" | grep "+COPS:" | head -1 | awk -F'"' '{print $2}' | tr -d '\r\n')
+
+# Temperature-only mode: just query temp and exit (used by action_status)
+if [ "$1" = "temp" ]; then
+  echo "temperature=$(get_temperature)"
+  exit 0
+fi
+
+case "$VENDOR" in
+  quectel)  query_quectel ;;
+  fibocom)  query_fibocom ;;
+  sierra)   query_sierra ;;
+  meig)     query_meig ;;
+  foxconn)  query_foxconn ;;
+  *)        query_generic ;;
+esac

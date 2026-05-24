@@ -1,0 +1,651 @@
+#!/bin/sh
+# Collect received SMS and decode PDU records without external helper scripts.
+
+decode_sms() {
+local format=text
+if [ "${1:-}" = "--json" ]; then format=json; shift; fi
+LC_ALL=C awk -v format="$format" -v mem1="${SMS_MEM1:-}" -v mem2="${SMS_MEM2:-}" -v mem3="${SMS_MEM3:-}" \
+    -v used1="${SMS_USED1:-}" -v total1="${SMS_TOTAL1:-}" \
+    -v used2="${SMS_USED2:-}" -v total2="${SMS_TOTAL2:-}" \
+    -v used3="${SMS_USED3:-}" -v total3="${SMS_TOTAL3:-}" '
+BEGIN {
+    unicode_awk = (sprintf("%c",256) != sprintf("%c",0))
+    power[0]=1
+    for(i=1;i<=8;i++) power[i]=power[i-1]*2
+    digits="0123456789ABCDEF"
+    for (i=1;i<=16;i++) hex[substr(digits,i,1)]=i-1
+    for (i=0;i<128;i++) gsm[i]=i
+    split("64 163 36 165 232 233 249 236 242 199 10 216 248 13 197 229 916 95 934 915 923 937 928 936 931 920 926 27 198 230 223 201", codes, " ")
+    for(i=1;i<=32;i++) gsm[i-1]=codes[i]
+    gsm[36]=164; gsm[64]=161; gsm[91]=196; gsm[92]=214; gsm[93]=209
+    gsm[94]=220; gsm[95]=167; gsm[96]=191; gsm[123]=228; gsm[124]=246
+    gsm[125]=241; gsm[126]=252; gsm[127]=224
+    ext[10]=12; ext[20]=94; ext[40]=123; ext[41]=125; ext[47]=92
+    ext[60]=91; ext[61]=126; ext[62]=93; ext[64]=124; ext[101]=8364
+}
+function h(s,    i,v) {
+    s=toupper(s); v=0
+    for(i=1;i<=length(s);i++) v=v*16+hex[substr(s,i,1)]
+    return v
+}
+function utf8(c) {
+    if(unicode_awk) return sprintf("%c",c)
+    if(c<128) return sprintf("%c",c)
+    if(c<2048) return sprintf("%c%c",192+int(c/64),128+c%64)
+    if(c<65536) return sprintf("%c%c%c",224+int(c/4096),128+int(c/64)%64,128+c%64)
+    return sprintf("%c%c%c%c",240+int(c/262144),128+int(c/4096)%64,128+int(c/64)%64,128+c%64)
+}
+function json(s,    i,c,out,j) {
+    out="\""
+    for(i=1;i<=length(s);i++) {
+        c=substr(s,i,1)
+        if(c=="\"") out=out "\\\""
+        else if(c=="\\") out=out "\\\\"
+        else {
+            for(j=0;j<32;j++) if(c==sprintf("%c",j)) break
+            out=out "" (j<32 ? sprintf("\\u%04x",j) : c)
+        }
+    }
+    return out "\""
+}
+function seven(s,n,skip,    i,b,off,v,out,escape) {
+    out=""; escape=0
+    for(i=0;i<n;i++) {
+        b=int(skip/8); off=skip%8
+        v=int(h(substr(s,b*2+1,2))/power[off])
+        if(off>1) v+=h(substr(s,b*2+3,2))*power[8-off]
+        v=v%128; skip+=7
+        if(escape) { out=out utf8((v in ext) ? ext[v] : 65533); escape=0 }
+        else if(v==27) escape=1
+        else out=out utf8(gsm[v])
+    }
+    return out "" (escape ? utf8(65533) : "")
+}
+function bcd(s) { return substr(s,2,1) substr(s,1,1) }
+function leap(y) { return y%4==0 && (y%100!=0 || y%400==0) }
+function epoch(y,m,d,hh,mm,ss,offset,    days,i,md) {
+    days=0
+    for(i=1970;i<y;i++) days+=365+leap(i)
+    for(i=1;i<m;i++) { md=(i==2 ? 28+leap(y) : (i==4||i==6||i==9||i==11 ? 30 : 31)); days+=md }
+    return ((days+d-1)*24+hh)*3600+mm*60+ss-offset*60
+}
+function decode(p,storage,    idx,sl,first,alen,toa,abytes,addr,i,dcs,alphabet,stamp,y,m,d,hh,mm,ss,tz,tzlo,offset,zone,ts,display,sort,udl,bytes,ud,header,pos,ie,len,ref,total,part,payload,chars,fill,cp,lo,body,base,id,md) {
+    if(p !~ /^[0-9A-Fa-f]+$/ || length(p)%2 || length(p)<32) return 0
+    sl=h(substr(p,1,2)); idx=3+sl*2
+    if(idx+5>length(p)) return 0
+    first=h(substr(p,idx,2)); idx+=2
+    if(first%4!=0) return 2
+    alen=h(substr(p,idx,2)); toa=h(substr(p,idx+2,2)); idx+=4
+    if(alen<1 || alen>40) return 0
+    abytes=int((alen+1)/2)
+    if(idx+abytes*2+19>length(p)) return 0
+    addr=substr(p,idx,abytes*2); idx+=abytes*2
+    if(int(toa/16)%8==5) sender=seven(addr,int(alen*4/7),0)
+    else {
+        sender=""
+        for(i=1;i<=length(addr);i+=2) sender=sender bcd(substr(addr,i,2))
+        sender=substr(sender,1,alen)
+        if(sender !~ /^[0-9*#abcABC]+$/) return 0
+        if(int(toa/16)%8==1) sender="+" sender
+    }
+    idx+=2
+    dcs=h(substr(p,idx,2)); idx+=2
+    if(dcs<128) {
+        if(int(dcs/32)%2) return 3
+        alphabet=int(dcs/4)%4
+    } else if(dcs>=192 && dcs<224) alphabet=0
+    else if(dcs>=224 && dcs<240) alphabet=2
+    else if(dcs>=240) alphabet=int(dcs/4)%2
+    else return 3
+    if(alphabet!=0 && alphabet!=2) return 3
+    stamp=substr(p,idx,14); idx+=14
+    if(substr(stamp,1,12) !~ /^[0-9]+$/) return 0
+    y=2000+bcd(substr(stamp,1,2)); m=bcd(substr(stamp,3,2))+0; d=bcd(substr(stamp,5,2))+0
+    hh=bcd(substr(stamp,7,2))+0; mm=bcd(substr(stamp,9,2))+0; ss=bcd(substr(stamp,11,2))+0
+    md=(m==2 ? 28+leap(y) : (m==4||m==6||m==9||m==11 ? 30 : 31))
+    if(m<1||m>12||d<1||d>md||hh>23||mm>59||ss>59) return 0
+    tz=h(substr(stamp,13,2)); tzlo=tz%16
+    offset=((tzlo%8)*10+int(tz/16))*15
+    zone=""
+    if(int(tz/16)<=9 && offset<=14*60) {
+        zone=sprintf("%s%02d:%02d",tzlo>=8 ? "-" : "+",int(offset/60),offset%60)
+        if(tzlo>=8) offset=-offset
+    } else offset=0
+    display=sprintf("%04d-%02d-%02d %02d:%02d:%02d",y,m,d,hh,mm,ss)
+    ts=sprintf("%04d-%02d-%02dT%02d:%02d:%02d",y,m,d,hh,mm,ss) zone
+    sort=epoch(y,m,d,hh,mm,ss,offset)
+    udl=h(substr(p,idx,2)); idx+=2
+    bytes=(alphabet==0 ? int((udl*7+7)/8) : udl)
+    if(bytes>140 || length(p)-idx+1!=bytes*2) return 0
+    ud=substr(p,idx,bytes*2); total=1; part=1; ref=""; header=0
+    if(int(first/64)%2) {
+        header=h(substr(ud,1,2))+1
+        if(header>bytes || header<1) return 0
+        pos=3
+        while(pos<=header*2) {
+            if(pos+3>header*2) return 0
+            ie=h(substr(ud,pos,2)); len=h(substr(ud,pos+2,2)); pos+=4
+            if(pos+len*2-1>header*2) return 0
+            if(ie==0 || ie==8) {
+                if(ref!="" || (ie==0 && len!=3) || (ie==8 && len!=4)) return 0
+                ref=ie ":" h(substr(ud,pos,(len-2)*2))
+                total=h(substr(ud,pos+(len-2)*2,2)); part=h(substr(ud,pos+(len-1)*2,2))
+                if(total<1||part<1||part>total) return 0
+            }
+            pos+=len*2
+        }
+    }
+    payload=substr(ud,header*2+1); body=""
+    if(alphabet==0) {
+        chars=udl-int((header*8+6)/7)
+        fill=int((header*8+6)/7)*7-header*8
+        if(chars<0 || chars*7+fill>length(payload)*4) return 0
+        body=seven(payload,chars,fill)
+    } else {
+        if(length(payload)%4) return 0
+        for(i=1;i<=length(payload);i+=4) {
+            cp=h(substr(payload,i,4))
+            if(cp>=55296 && cp<=56319) {
+                lo=h(substr(payload,i+4,4))
+                if(i+7<=length(payload) && lo>=56320 && lo<=57343) { cp=65536+(cp-55296)*1024+lo-56320; i+=4 }
+                else cp=65533
+            } else if(cp>=56320 && cp<=57343) cp=65533
+            body=body utf8(cp)
+        }
+    }
+    id=(storage!="" ? "sms-" storage : "line-" NR)
+    base=(ref=="" ? id : sender SUBSEP ref SUBSEP dcs SUBSEP total)
+    # Reused references are ambiguous: show individual parts rather than mixing text.
+    if((base SUBSEP part) in seen) {
+        if(seen[base,part]==p) return 1
+        conflict[base]=1
+    }
+    if((base in firsttime) && (sort-firsttime[base]>86400 || firsttime[base]-sort>86400)) conflict[base]=1
+    if(!(base in firsttime)) firsttime[base]=sort
+    seen[base,part]=p
+    n++
+    rbase[n]=base; rid[n]=id; rsender[n]=sender; rtext[n]=body; rtime[n]=ts
+    rdisplay[n]=display; rsort[n]=sort; rtotal[n]=total; rpart[n]=part; rindex[n]=storage
+    return 1
+}
+{
+    gsub(/\r/,""); sub(/^[[:space:]]+/,""); sub(/[[:space:]]+$/,"")
+    if(/^\+CMGL:/) {
+        if(pending) malformed++
+        line=$0; sub(/^\+CMGL:[[:space:]]*/,"",line); split(line,fields,",")
+        storage=fields[1]; status=fields[2]; gsub(/[[:space:]"]/, "", status)
+        pending=(storage ~ /^[0-9]+$/); next
+    }
+    if(pending) {
+        if(/^AT/ || /^\+CMTI:/ || $0=="") next
+        if(status=="0"||status=="1"||status=="RECUNREAD"||status=="RECREAD") {
+            result=decode($0,storage)
+            if(result==0) malformed++
+            if(result==3) unsupported++
+        }
+        pending=0
+    } else if(format!="json" && /^[0-9A-Fa-f]+$/) {
+        result=decode($0,"")
+        if(result==0) malformed++
+        if(result==3) unsupported++
+    }
+}
+END {
+    if(pending) malformed++
+    for(i=1;i<=n;i++) {
+        base=rbase[i]; group=(conflict[base] ? rid[i] : base)
+        if(!(group in gsender)) {
+            order[++count]=group; gsender[group]=rsender[i]; gid[group]=rid[i]
+            gtime[group]=rtime[i]; gdisplay[group]=rdisplay[i]; gsort[group]=rsort[i]; gtotal[group]=rtotal[i]
+        }
+        if(rsort[i]<gsort[group]) { gtime[group]=rtime[i]; gdisplay[group]=rdisplay[i]; gsort[group]=rsort[i] }
+        if(!((group SUBSEP rpart[i]) in gtext)) greceived[group]++
+        gtext[group,rpart[i]]=rtext[i]
+        if(rindex[i]!="" && !((group SUBSEP rindex[i]) in haveindex)) {
+            haveindex[group,rindex[i]]=1
+            gicount[group]++
+            gindex[group,gicount[group]]=rindex[i]+0
+        }
+    }
+    for(i=2;i<=count;i++) {
+        key=order[i]; j=i-1
+        while(j>=1 && (gsort[order[j]]>gsort[key] || (gsort[order[j]]==gsort[key] && gid[order[j]]>gid[key]))) { order[j+1]=order[j]; j-- }
+        order[j+1]=key
+    }
+    if(format=="json") printf "{\"messages\":["
+    for(i=1;i<=count;i++) {
+        g=order[i]; full=""
+        for(p=1;p<=gtotal[g];p++) full=full "" (((g SUBSEP p) in gtext) ? gtext[g,p] : "[Missing part " p "]")
+        if(format=="json") {
+            if(i>1) printf ","
+            for(a=1;a<=gicount[g];a++) for(b=a+1;b<=gicount[g];b++) if(gindex[g,a]>gindex[g,b]) {
+                swap=gindex[g,a]; gindex[g,a]=gindex[g,b]; gindex[g,b]=swap
+            }
+            printf "{\"id\":%s,\"sender\":%s,\"timestamp\":%s,\"text\":%s,\"complete\":%s,\"parts\":%d,\"received_parts\":%d,\"indexes\":[", json(gid[g]),json(gsender[g]),json(gtime[g]),json(full),greceived[g]==gtotal[g] ? "true" : "false",gtotal[g],greceived[g]
+            for(a=1;a<=gicount[g];a++) printf "%s%d",(a>1 ? "," : ""),gindex[g,a]
+            printf "]}"
+        } else {
+            print "--------------------------------------------------"
+            print "[Time]:   " gdisplay[g] "\n[Sender]: " gsender[g] "\n[Text]:   " full "\n"
+        }
+    }
+    if(format=="json") {
+        printf "]"
+        if(mem1!="") {
+            printf ",\"storage\":{\"mem1\":%s,\"mem2\":%s,\"mem3\":%s",json(mem1),json(mem2),json(mem3)
+            if(used1!="" && total1!="" && used2!="" && total2!="" && used3!="" && total3!="") {
+                printf ",\"usage\":{\"mem1\":{\"used\":%d,\"total\":%d},\"mem2\":{\"used\":%d,\"total\":%d},\"mem3\":{\"used\":%d,\"total\":%d}}",used1,total1,used2,total2,used3,total3
+            }
+            printf "}"
+        }
+        printf ",\"warnings\":["
+        if(malformed) printf "%s",json(malformed " malformed message(s) skipped.")
+        if(unsupported) printf "%s%s",malformed ? "," : "",json(unsupported " unsupported encoding(s) skipped.")
+        print "]}"
+    } else print "--------------------------------------------------"
+}
+' "$@"
+
+}
+
+if [ "${1:-}" = "--decode" ]; then
+    shift
+    decode_sms "$@"
+    exit $?
+fi
+
+ACTION=list
+DELETE_INDEXES=
+EXPECTED_MEM1=
+SEND_TO=
+SEND_TEXT=
+SMS_USED1=; SMS_TOTAL1=
+SMS_USED2=; SMS_TOTAL2=
+SMS_USED3=; SMS_TOTAL3=
+if [ "${1:-}" = "--delete" ]; then
+    ACTION=delete
+    DELETE_INDEXES=${2:-}
+    EXPECTED_MEM1=${3:-}
+elif [ "${1:-}" = "--send" ]; then
+    ACTION=send
+    SEND_TO=${2:-}
+    SEND_TEXT=${3:-}
+fi
+
+umask 077
+STATE=/tmp/modem-state
+LOCK=/tmp/modem-sms.lock
+AT_LOCK=/tmp/modem-at.lock
+locked=0
+at_locked=0
+restore=""
+error() {
+    printf '{"error":"%s","messages":[],"warnings":[]}\n' "$1"
+    exit 1
+}
+storage_error() {
+    printf '{"error":"%s","code":"storage_changed","messages":[],"warnings":[]}\n' "$1"
+    exit 1
+}
+read_state() { sed -n "s/^$1=//p" "$STATE" 2>/dev/null | head -n 1; }
+ok() { printf "%s\n" "$1" | tr -d "\r" | grep -q "^[[:space:]]*OK[[:space:]]*$"; }
+load_storage() {
+    SMS_MEM1=$(uci -q get modemmanager.main.sms_mem1 2>/dev/null); [ -n "$SMS_MEM1" ] || SMS_MEM1=ME
+    SMS_MEM2=$(uci -q get modemmanager.main.sms_mem2 2>/dev/null); [ -n "$SMS_MEM2" ] || SMS_MEM2=ME
+    SMS_MEM3=$(uci -q get modemmanager.main.sms_mem3 2>/dev/null); [ -n "$SMS_MEM3" ] || SMS_MEM3=ME
+    for memory in "$SMS_MEM1" "$SMS_MEM2" "$SMS_MEM3"; do
+        case "$memory" in ME|MT|SM|SR) ;; *) error "Invalid SMS storage configuration.";; esac
+    done
+    export SMS_MEM1 SMS_MEM2 SMS_MEM3
+}
+AT_TIMEOUT_MODE=portable
+if command -v timeout >/dev/null 2>&1; then
+    AT_TIMEOUT_MODE=command
+elif command -v busybox >/dev/null 2>&1 && busybox timeout -s KILL 1 true >/dev/null 2>&1; then
+    AT_TIMEOUT_MODE=busybox
+fi
+if command -v sms_tool_q >/dev/null 2>&1; then tool=sms_tool_q
+elif command -v sms_tool >/dev/null 2>&1; then tool=sms_tool
+else error "No AT tool found."
+fi
+case "$(read_state status)" in
+    ""|no_modem|rebooting|disabled|sim_absent|sim_locked|sim_not_ready)
+        error "Modem or SIM unavailable. Refresh after it is ready." ;;
+esac
+device=$(read_state at_device)
+case "$device" in
+    /dev/wwan0at0|/dev/ttyUSB2|/dev/ttyUSB1|/dev/ttyUSB0|/dev/mhi_DUN|/dev/mhi_AT) ;;
+    *) error "No confirmed AT port. Wait for modem detection." ;;
+esac
+[ -c "$device" ] || error "Modem AT port is unavailable."
+identity=$(stat -c '%i:%Y' "$device") || error "Cannot identify AT port."
+session_id=$(read_state session_id)
+same_modem() {
+    [ -c "$device" ] && [ "$(stat -c '%i:%Y' "$device" 2>/dev/null)" = "$identity" ] &&
+    [ "$(read_state at_device)" = "$device" ] || return 1
+    if [ -n "$session_id" ]; then
+        [ "$(read_state session_id)" = "$session_id" ] || return 1
+    fi
+    case "$(read_state status)" in ""|no_modem|rebooting|disabled|sim_absent|sim_locked|sim_not_ready) return 1;; esac
+}
+at() {
+    local seconds="$1" command="$2" output pid watchdog status
+    case "$AT_TIMEOUT_MODE" in
+        command)
+            timeout -s KILL "$seconds" "$tool" -D -d "$device" at "$command" 2>/dev/null
+            ;;
+        busybox)
+            busybox timeout -s KILL "$seconds" "$tool" -D -d "$device" at "$command" 2>/dev/null
+            ;;
+        *)
+            # Some OpenWrt images omit the timeout applet. Bound the AT call
+            # with shell primitives so SMS reading still cannot hang forever.
+            output="$LOCK/at-output"
+            : > "$output" || return 1
+            "$tool" -D -d "$device" at "$command" > "$output" 2>/dev/null &
+            pid=$!
+            (
+                timer=""
+                trap '[ -n "$timer" ] && kill "$timer" 2>/dev/null; exit 0' HUP INT TERM
+                sleep "$seconds" &
+                timer=$!
+                wait "$timer" || exit 0
+                kill -TERM "$pid" 2>/dev/null
+                sleep 1 &
+                timer=$!
+                wait "$timer" || exit 0
+                kill -KILL "$pid" 2>/dev/null
+            ) >/dev/null 2>&1 &
+            watchdog=$!
+            wait "$pid"
+            status=$?
+            kill "$watchdog" 2>/dev/null
+            wait "$watchdog" 2>/dev/null
+            cat "$output"
+            rm -f "$output"
+            return "$status"
+            ;;
+    esac
+}
+send_with_timeout() {
+    local output pid watchdog status
+    case "$AT_TIMEOUT_MODE" in
+        command)
+            timeout -s KILL 20 "$tool" -d "$device" -- send "$SEND_NUMBER" "$SEND_TEXT" 2>&1
+            ;;
+        busybox)
+            busybox timeout -s KILL 20 "$tool" -d "$device" -- send "$SEND_NUMBER" "$SEND_TEXT" 2>&1
+            ;;
+        *)
+            output="$LOCK/send-output"
+            : > "$output" || return 1
+            "$tool" -d "$device" -- send "$SEND_NUMBER" "$SEND_TEXT" > "$output" 2>&1 &
+            pid=$!
+            (
+                timer=""
+                trap '[ -n "$timer" ] && kill "$timer" 2>/dev/null; exit 0' HUP INT TERM
+                sleep 20 &
+                timer=$!
+                wait "$timer" || exit 0
+                kill -TERM "$pid" 2>/dev/null
+                sleep 1 &
+                timer=$!
+                wait "$timer" || exit 0
+                kill -KILL "$pid" 2>/dev/null
+            ) >/dev/null 2>&1 &
+            watchdog=$!
+            wait "$pid"
+            status=$?
+            kill "$watchdog" 2>/dev/null
+            wait "$watchdog" 2>/dev/null
+            cat "$output"
+            rm -f "$output"
+            return "$status"
+            ;;
+    esac
+}
+sms_text_info() {
+    LC_ALL=C awk '
+        BEGIN {
+            # Build ord() locally so minimal OpenWrt images do not need od.
+            for(i=1;i<256;i++) byte_value[sprintf("%c",i)]=i
+            for(i=32;i<=35;i++) gsm[i]=1
+            for(i=37;i<=63;i++) gsm[i]=1
+            for(i=65;i<=90;i++) gsm[i]=1
+            for(i=97;i<=122;i++) gsm[i]=1
+            split("64 163 36 165 232 233 249 236 242 199 10 216 248 13 197 229 916 95 934 915 923 937 928 936 931 920 926 198 230 223 201 164 161 196 214 209 220 167 191 228 246 241 252 224", basic, " ")
+            for(i in basic) gsm[basic[i]]=1
+            split("12 94 123 125 92 91 126 93 124 8364", ext, " ")
+            for(i in ext) gsm[ext[i]]=2
+        }
+        NR>1 { byte[++count]=10 }
+        {
+            for(i=1;i<=length($0);i++) {
+                value=substr($0,i,1)
+                if(!(value in byte_value)) { invalid=1; next }
+                byte[++count]=byte_value[value]
+            }
+        }
+        END {
+            # The caller appends X so a real trailing newline is retained.
+            if(count<1 || byte[count]!=88) invalid=1
+            else count--
+            pos=1; units=0; septets=0; all_gsm=1
+            while(pos<=count) {
+                b=byte[pos++]
+                if(b<128) cp=b
+                else if(b>=194 && b<=223 && pos<=count && byte[pos]>=128 && byte[pos]<=191) {
+                    cp=(b-192)*64+(byte[pos++]-128)
+                } else if(b>=224 && b<=239 && pos+1<=count &&
+                          byte[pos]>=128 && byte[pos]<=191 && byte[pos+1]>=128 && byte[pos+1]<=191 &&
+                          !(b==224 && byte[pos]<160) && !(b==237 && byte[pos]>=160)) {
+                    cp=(b-224)*4096+(byte[pos]-128)*64+(byte[pos+1]-128); pos+=2
+                } else { invalid=1; break }
+                if(cp==0 || (cp>=55296 && cp<=57343)) { invalid=1; break }
+                units++
+                if(cp in gsm) septets+=gsm[cp]; else all_gsm=0
+            }
+            if(invalid) print "unsupported 0 0"
+            else if(all_gsm && septets>160) print "too_long_gsm7 " septets " 160"
+            else if(!all_gsm && units>70) print "too_long_ucs2 " units " 70"
+            else if(all_gsm) print "gsm7 " septets " 160"
+            else print "ucs2 " units " 70"
+        }
+    '
+}
+cleanup() {
+    if [ -n "$restore" ] && same_modem; then at 5 "AT+CMGF=$restore" >/dev/null; fi
+    if [ "$at_locked" = 1 ]; then
+        lock_owner=$(cat "$AT_LOCK/pid" 2>/dev/null)
+        if [ "$lock_owner" = "$$" ]; then
+            rm -f "$AT_LOCK/pid"
+            rmdir "$AT_LOCK" 2>/dev/null
+        fi
+    fi
+    if [ "$locked" = 1 ]; then
+        rm -f "$LOCK/at-output"
+        rm -f "$LOCK/send-output"
+        rm -f "$LOCK/pid"
+        rmdir "$LOCK" 2>/dev/null
+    fi
+}
+trap cleanup EXIT
+trap 'exit 1' HUP INT TERM
+if ! mkdir "$LOCK" 2>/dev/null; then
+    owner=$(cat "$LOCK/pid" 2>/dev/null)
+    case "$owner" in ""|*[!0-9]*) error "SMS reader busy. Try Refresh shortly.";; esac
+    if kill -0 "$owner" 2>/dev/null; then error "SMS reader busy. Try Refresh shortly."; fi
+    # Remove only the stale lock owner file, never recurse through /tmp.
+    rm -f "$LOCK/pid"
+    rmdir "$LOCK" 2>/dev/null
+    mkdir "$LOCK" 2>/dev/null || error "SMS reader busy. Try Refresh shortly."
+fi
+locked=1
+printf "%s\n" "$$" > "$LOCK/pid"
+
+# Reject unsupported transports and invalid payloads before opening the AT
+# port. The LuCI check is only presentation; this is the security boundary.
+if [ "$ACTION" = send ]; then
+    case "$device" in
+        /dev/ttyUSB0|/dev/ttyUSB1|/dev/ttyUSB2) ;;
+        *)
+            printf '{"error":"SMS sending is temporarily unavailable for PCIe modems.","code":"send_unsupported"}\n'
+            exit 1
+            ;;
+    esac
+    case "$SEND_TO" in
+        +*) SEND_NUMBER=${SEND_TO#+} ;;
+        *) SEND_NUMBER=$SEND_TO ;;
+    esac
+    case "$SEND_NUMBER" in ""|*[!0-9]*) error "Enter a valid destination number.";; esac
+    [ "${#SEND_NUMBER}" -le 20 ] || error "Destination number is too long."
+    [ -n "$SEND_TEXT" ] || error "Enter a message to send."
+    text_info=$(printf '%sX' "$SEND_TEXT" | sms_text_info) || error "Cannot validate the SMS text."
+    set -- $text_info
+    encoding=${1:-unsupported}; units=${2:-0}; limit=${3:-0}
+    case "$encoding" in
+        gsm7|ucs2) [ "$units" -gt 0 ] || error "Enter a message to send." ;;
+        too_long_gsm7) error "Message is longer than one 160-septet GSM-7 SMS." ;;
+        too_long_ucs2) error "Unicode message is longer than one 70-character SMS." ;;
+        *) error "Message contains invalid UTF-8 or characters outside UCS-2. Emoji are not supported." ;;
+    esac
+    if [ "$encoding" = ucs2 ] && [ "$tool" != sms_tool_q ]; then
+        error "Unicode SMS validation requires modified sms_tool_q utility"
+    fi
+fi
+
+# Serialize complete multi-command AT transactions. This prevents watchdog,
+# signal and manual requests from consuming each other's modem responses.
+if ! mkdir "$AT_LOCK" 2>/dev/null; then
+    at_owner=$(cat "$AT_LOCK/pid" 2>/dev/null)
+    case "$at_owner" in
+        ""|*[!0-9]*)
+            sleep 1
+            at_owner=$(cat "$AT_LOCK/pid" 2>/dev/null)
+            ;;
+    esac
+    if [ -n "$at_owner" ] && kill -0 "$at_owner" 2>/dev/null; then
+        error "AT port busy. Try Refresh shortly."
+    fi
+    rm -f "$AT_LOCK/pid"
+    rmdir "$AT_LOCK" 2>/dev/null
+    mkdir "$AT_LOCK" 2>/dev/null || error "AT port busy. Try Refresh shortly."
+fi
+at_locked=1
+printf "%s\n" "$$" > "$AT_LOCK/pid"
+
+response=$(at 5 AT)
+ok "$response" || error "AT port did not respond. Try Refresh."
+load_storage
+response=$(at 5 "AT+CPMS=\"$SMS_MEM1\",\"$SMS_MEM2\",\"$SMS_MEM3\"")
+ok "$response" || error "Modem rejected the selected SMS storage."
+cpms_usage=$(printf "%s\n" "$response" | tr -d '\r' | awk '
+    /^\+CPMS:/ {
+        sub(/^\+CPMS:[[:space:]]*/, "")
+        gsub(/[[:space:]]/, "")
+        count=split($0, value, ",")
+        if(count!=6) exit
+        for(i=1;i<=6;i++) if(value[i]!~/^[0-9]+$/) exit
+        print value[1],value[2],value[3],value[4],value[5],value[6]
+        exit
+    }
+')
+set -- $cpms_usage
+if [ "$#" = 6 ]; then
+    SMS_USED1=$1; SMS_TOTAL1=$2
+    SMS_USED2=$3; SMS_TOTAL2=$4
+    SMS_USED3=$5; SMS_TOTAL3=$6
+    export SMS_USED1 SMS_TOTAL1 SMS_USED2 SMS_TOTAL2 SMS_USED3 SMS_TOTAL3
+fi
+
+if [ "$ACTION" = delete ]; then
+    [ "$EXPECTED_MEM1" = "$SMS_MEM1" ] || storage_error "SMS storage changed. Refresh before deleting."
+    case "$DELETE_INDEXES" in ""|*[!0-9,]*|,*|*,|*,,*) error "Invalid SMS message index.";; esac
+    old_ifs=$IFS
+    IFS=,
+    set -- $DELETE_INDEXES
+    IFS=$old_ifs
+    unique=" "
+    deleted=
+    failed=
+    for index do
+        case "$index" in ""|*[!0-9]*) error "Invalid SMS message index.";; esac
+        case "$unique" in *" $index "*) continue;; esac
+        unique="$unique$index "
+        deleted_index=0
+        attempt=1
+        while [ "$attempt" -le 2 ]; do
+            response=$(at 5 "AT+CMGD=$index")
+            if ok "$response"; then
+                deleted_index=1
+                break
+            fi
+            [ "$attempt" -lt 2 ] && sleep 1
+            attempt=$((attempt + 1))
+        done
+        if [ "$deleted_index" = 1 ]; then
+            deleted="${deleted}${deleted:+,}$index"
+        else
+            failed="${failed}${failed:+,}$index"
+        fi
+    done
+    same_modem || error "Modem changed while deleting SMS. Refresh again."
+    printf '{"deleted":[%s],"failed":[%s],"storage":{"mem1":"%s","mem2":"%s","mem3":"%s"}}\n' "$deleted" "$failed" "$SMS_MEM1" "$SMS_MEM2" "$SMS_MEM3"
+    [ -z "$failed" ]
+    exit $?
+fi
+
+if [ "$ACTION" = send ]; then
+    response=$(at 5 'AT+CMGF?')
+    ok "$response" || error "Cannot read SMS format before sending."
+    original=$(printf "%s\n" "$response" | tr -d '\r' | sed -n 's/^+CMGF:[[:space:]]*\([01]\)[[:space:]]*$/\1/p' | head -n 1)
+    case "$original" in 0|1) ;; *) error "Invalid SMS format response.";; esac
+    restore=$original
+
+    send_response=$(send_with_timeout)
+    send_status=$?
+    sent=0
+    if [ "$send_status" -eq 0 ] && ! printf '%s\n' "$send_response" | grep -qE '^\+?CMS ERROR:|sms not sent|No response from modem|command error'; then
+        sent=1
+    fi
+
+    restored=$(at 5 "AT+CMGF=$original")
+    restore_warning=""
+    if ok "$restored"; then
+        restore=""
+    else
+        restore_warning="Message sent, but the modem SMS format could not be restored."
+    fi
+
+    if [ "$sent" = 1 ]; then
+        same_modem || restore_warning="Message was accepted, but the modem changed before verification."
+        printf '{"sent":true,"recipient":"%s","encoding":"%s","length":%s,"limit":%s' "$SEND_TO" "$encoding" "$units" "$limit"
+        [ "$encoding" = gsm7 ] && printf ',"septets":%s' "$units"
+        [ -n "$restore_warning" ] && printf ',"warning":"%s"' "$restore_warning"
+        printf '}\n'
+        exit 0
+    fi
+
+    if printf '%s\n' "$send_response" | grep -q 'CMS ERROR'; then
+        error "The modem rejected the SMS. Check service and recipient."
+    fi
+    error "SMS sending failed or timed out. Try again."
+fi
+
+response=$(at 5 'AT+CMGF?')
+ok "$response" || error "Cannot read SMS format."
+original=$(printf "%s\n" "$response" | tr -d '\r' | sed -n 's/^+CMGF:[[:space:]]*\([01]\)[[:space:]]*$/\1/p' | head -n 1)
+case "$original" in 0|1) ;; *) error "Invalid SMS format response.";; esac
+restore=$original
+response=$(at 5 'AT+CMGF=0')
+ok "$response" || error "Modem rejected PDU mode."
+response=$(at 20 'AT+CMGL=4')
+# Never mistake a timeout, truncated response or CMS error for an empty inbox.
+final=$(printf "%s\n" "$response" | tr -d '\r' | sed '/^[[:space:]]*$/d' | tail -n 1)
+[ "$final" = OK ] || error "SMS listing failed or timed out. Try Refresh."
+same_modem || error "Modem changed while reading SMS. Refresh again."
+restored=$(at 5 "AT+CMGF=$original")
+ok "$restored" || error "Unable to restore SMS format. Try Refresh."
+restore=""
+same_modem || error "Modem changed while reading SMS. Refresh again."
+printf "%s\n" "$response" | decode_sms --json

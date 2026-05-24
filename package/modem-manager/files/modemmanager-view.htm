@@ -1,0 +1,1184 @@
+<%+header%>
+
+<%
+local modem_state = {}
+local state_file_exists = false
+local f = io.open("/tmp/modem-state", "r")
+if f then
+    state_file_exists = true
+    for line in f:lines() do
+        local k, v = line:match("^(%S+)=(.+)$")
+        if k then modem_state[k] = v end
+    end
+    f:close()
+end
+%>
+
+<h2><%:Cellular Manager%></h2>
+
+<style>
+.tabs { display:flex; gap:4px; margin-bottom:15px; border-bottom:1px solid #ccc; }
+.tabs .tab { padding:8px 20px; cursor:pointer; background:#e8e8e8; color:#333; border:1px solid #ccc; border-bottom:none; border-radius:4px 4px 0 0; }
+.tabs .tab.active { background:#0066cc; color:#fff; }
+.modem-summary { border:1px solid rgba(127,127,127,.3); border-radius:8px; padding:15px 16px; margin-bottom:14px; background:rgba(127,127,127,.06); }
+.modem-summary-head { display:flex; align-items:flex-start; justify-content:space-between; gap:14px; margin-bottom:14px; }
+.modem-identity { min-width:0; }
+.modem-summary-label { display:block; margin-bottom:3px; font-size:11px; text-transform:uppercase; letter-spacing:.04em; opacity:.55; }
+.modem-name { font-size:17px; font-weight:700; line-height:1.35; overflow-wrap:anywhere; }
+.modem-revision { margin-top:3px; font-size:12px; opacity:.65; overflow-wrap:anywhere; }
+.modem-status-badge { flex:none; display:inline-block; padding:4px 10px; border-radius:999px; font-size:12px; font-weight:700; white-space:nowrap; background:rgba(127,127,127,.15); }
+.modem-status-badge.connected { color:#16803c; background:rgba(32,180,85,.14); }
+.modem-status-badge.warning { color:#a36800; background:rgba(230,155,20,.16); }
+.modem-status-badge.error { color:#c62828; background:rgba(198,40,40,.12); }
+.modem-status-badge.neutral { opacity:.7; }
+.modem-meta { display:grid; grid-template-columns:repeat(2,minmax(120px,1fr)); gap:8px 18px; padding-top:11px; border-top:1px solid rgba(127,127,127,.2); }
+.modem-meta-item { min-width:0; }
+.modem-meta-label { display:block; font-size:11px; text-transform:uppercase; letter-spacing:.04em; opacity:.55; }
+.modem-meta-value { display:block; margin-top:2px; font-size:14px; font-weight:600; overflow-wrap:anywhere; }
+.signal-toolbar { display:flex; align-items:center; gap:12px; margin-bottom:12px; flex-wrap:wrap; }
+.signal-toolbar .signal-updated { margin-left:auto; font-size:12px; opacity:.65; }
+.signal-summary { border:1px solid rgba(127,127,127,.3); border-radius:8px; padding:14px 16px; margin-bottom:14px; background:rgba(127,127,127,.06); }
+.signal-summary-main { display:flex; align-items:baseline; gap:10px; flex-wrap:wrap; margin-bottom:10px; }
+.signal-mode { font-size:18px; font-weight:700; }
+.signal-operator { font-size:15px; opacity:.8; }
+.signal-meta { display:grid; grid-template-columns:repeat(3,minmax(120px,1fr)); gap:8px 18px; }
+.signal-meta-item { min-width:0; }
+.signal-meta-label { display:block; font-size:11px; text-transform:uppercase; letter-spacing:.04em; opacity:.55; }
+.signal-meta-value { display:block; font-weight:600; overflow-wrap:anywhere; }
+.carrier-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(260px,1fr)); gap:12px; }
+.carrier-card { border:1px solid rgba(127,127,127,.3); border-radius:8px; padding:13px; background:rgba(127,127,127,.04); min-width:0; }
+.carrier-card.inactive { opacity:.78; }
+.carrier-head { display:flex; align-items:flex-start; justify-content:space-between; gap:10px; margin-bottom:12px; }
+.carrier-title { font-size:15px; font-weight:700; }
+.carrier-subtitle { margin-top:2px; font-size:12px; opacity:.65; }
+.carrier-badges { display:flex; justify-content:flex-end; gap:5px; flex-wrap:wrap; }
+.signal-badge { display:inline-block; padding:2px 7px; border-radius:999px; font-size:11px; font-weight:600; white-space:nowrap; background:rgba(127,127,127,.15); }
+.signal-badge.active { color:#16803c; background:rgba(32,180,85,.14); }
+.signal-badge.inactive { color:#a36800; background:rgba(230,155,20,.16); }
+.carrier-metrics { display:grid; grid-template-columns:repeat(3,1fr); gap:7px; margin-bottom:11px; }
+.carrier-metric { padding:8px 6px; border-radius:6px; text-align:center; background:rgba(127,127,127,.09); min-width:0; }
+.metric-label { display:block; font-size:10px; letter-spacing:.04em; opacity:.55; }
+.metric-value { display:block; margin-top:2px; font-size:14px; font-weight:700; overflow-wrap:anywhere; }
+.quality-good { color:#16803c; }
+.quality-warn { color:#b36b00; }
+.quality-poor { color:#c62828; }
+.quality-neutral { opacity:.7; }
+.carrier-details { display:grid; grid-template-columns:repeat(3,1fr); gap:6px; padding-top:9px; border-top:1px solid rgba(127,127,127,.2); }
+.carrier-detail { min-width:0; }
+.carrier-detail-label { display:block; font-size:10px; text-transform:uppercase; opacity:.5; }
+.carrier-detail-value { display:block; font-size:12px; font-weight:600; overflow-wrap:anywhere; }
+.signal-empty { display:none; padding:25px; text-align:center; opacity:.6; }
+.sms-toolbar { display:flex; align-items:center; gap:12px; flex-wrap:wrap; margin-bottom:12px; }
+.sms-toolbar span { font-size:12px; opacity:.75; }
+.sms-storage { margin-bottom:12px; }
+.sms-storage-grid { display:grid; grid-template-columns:repeat(3,minmax(140px,1fr)) auto; gap:10px 14px; align-items:end; }
+.sms-storage-item label { display:block; margin-bottom:4px; font-size:11px; text-transform:uppercase; letter-spacing:.04em; opacity:.65; }
+.sms-storage-item select { width:100%; }
+.sms-storage-action { padding-bottom:1px; }
+.sms-layout { display:grid; grid-template-columns:minmax(220px,30%) minmax(0,1fr); height:560px; max-height:75vh; min-height:320px; border:1px solid rgba(127,127,127,.3); border-radius:12px; overflow:hidden; background:rgba(127,127,127,.035); }
+.sms-senders { overflow-y:auto; border-right:1px solid rgba(127,127,127,.2); }
+.sms-sender { display:flex; align-items:center; gap:10px; width:100%; padding:15px 12px; border:0; border-bottom:1px solid rgba(127,127,127,.13); background:transparent; color:inherit; text-align:left; cursor:pointer; font:inherit; }
+.sms-sender:hover { background:rgba(127,127,127,.09); }
+.sms-sender.selected { background:rgba(0,102,204,.12); box-shadow:inset 3px 0 #0066cc; }
+.sms-avatar { display:flex; flex:none; align-items:center; justify-content:center; width:38px; height:38px; border-radius:50%; background:rgba(0,102,204,.14); color:#368cdd; font-weight:700; }
+.sms-sender-copy { min-width:0; flex:1; }
+.sms-sender-line { display:flex; justify-content:space-between; align-items:baseline; gap:8px; }
+.sms-sender-name { font-weight:600; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.sms-preview { display:block; margin-top:4px; font-size:12px; opacity:.65; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+.sms-sender-time { flex:none; font-size:10px; opacity:.65; }
+.sms-conversation { display:flex; flex-direction:column; min-width:0; min-height:0; }
+.sms-conversation-head { display:flex; align-items:center; gap:10px; padding:14px 18px; border-bottom:1px solid rgba(127,127,127,.2); min-height:25px; }
+.sms-conversation-title { font-size:16px; font-weight:600; overflow-wrap:anywhere; }
+.sms-back { display:none; }
+.sms-messages { overflow-y:auto; padding:18px; flex:1; min-height:0; }
+.sms-day { margin:8px 0 18px; text-align:center; font-size:11px; opacity:.65; }
+.sms-bubble { width:fit-content; max-width:85%; padding:12px 15px; margin-bottom:12px; border:1px solid rgba(127,127,127,.12); border-radius:16px 16px 16px 4px; background:rgba(127,127,127,.12); }
+.sms-bubble.outgoing { margin-left:auto; border-radius:16px 16px 4px 16px; background:rgba(0,102,204,.16); border-color:rgba(0,102,204,.22); }
+.sms-text { white-space:pre-wrap; overflow-wrap:anywhere; line-height:1.6; }
+.sms-bubble-footer { display:flex; align-items:center; justify-content:flex-end; gap:9px; margin-top:7px; }
+.sms-time { font-size:10px; opacity:.65; }
+.sms-delete { border:0; padding:0; background:transparent; color:#c62828; font:inherit; font-size:11px; cursor:pointer; }
+.sms-delete:hover { text-decoration:underline; }
+.sms-delete:disabled { cursor:default; opacity:.45; text-decoration:none; }
+.sms-incomplete { display:block; margin-top:8px; font-size:11px; color:#b36b00; }
+.sms-empty { padding:30px 16px; text-align:center; opacity:.65; }
+.sms-note { margin:10px 0; font-size:11px; opacity:.6; }
+.sms-composer { padding:12px 14px; border-top:1px solid rgba(127,127,127,.2); background:rgba(127,127,127,.035); }
+.sms-compose-recipient { display:flex; align-items:center; gap:8px; margin-bottom:8px; }
+.sms-compose-recipient label { flex:none; font-size:11px; text-transform:uppercase; letter-spacing:.04em; opacity:.65; }
+.sms-compose-recipient input { min-width:0; flex:1; }
+.sms-compose-message { display:flex; align-items:flex-end; gap:9px; }
+.sms-compose-message textarea { flex:1; min-width:0; resize:vertical; max-height:130px; }
+.sms-compose-actions { display:flex; flex-direction:column; align-items:flex-end; gap:5px; }
+.sms-counter { font-size:10px; opacity:.65; white-space:nowrap; }
+.sms-counter.invalid { color:#c62828; opacity:1; }
+.sms-send-note { min-height:16px; margin-top:6px; font-size:11px; opacity:.7; }
+@media (max-width:600px) {
+	.tabs { overflow-x:auto; }
+	.tabs .tab { padding:8px 14px; }
+	.modem-summary-head { flex-direction:column; gap:9px; }
+	.signal-toolbar { align-items:flex-start; }
+	.signal-toolbar .signal-updated { width:100%; margin-left:0; }
+	.signal-meta { grid-template-columns:repeat(2,minmax(0,1fr)); }
+	.carrier-grid { grid-template-columns:1fr; }
+	.sms-storage-grid { grid-template-columns:1fr; }
+	.sms-storage-action input { width:100%; }
+	.sms-layout { display:block; height:65vh; }
+	.sms-senders { height:100%; border-right:0; }
+	.sms-conversation { display:none; height:100%; }
+	.sms-layout.conversation-open .sms-senders { display:none; }
+	.sms-layout.conversation-open .sms-conversation { display:flex; }
+	.sms-back { display:inline-block; }
+	.sms-bubble { max-width:92%; }
+	.sms-messages { padding:12px; }
+	.sms-composer { padding:10px; }
+	.sms-compose-message { align-items:stretch; }
+}
+@media (max-width:400px) {
+	.modem-meta { grid-template-columns:1fr; }
+}
+</style>
+
+<div class="tabs">
+	<a class="tab active" id="tab-btn-status" onclick="showTab('status')"><%:Status%></a>
+	<a class="tab" id="tab-btn-signal" onclick="showTab('signal')"><%:Signal%></a>
+	<a class="tab" id="tab-btn-sms" onclick="showTab('sms')"><%:SMS%></a>
+	<a class="tab" id="tab-btn-log" onclick="showTab('log')"><%:Log%></a>
+</div>
+
+<div id="tab-status">
+
+<%
+local status = modem_state.status or "unknown"
+local status_class = "neutral"
+local status_text = "Unknown"
+local has_modem = state_file_exists and status ~= "no_modem" and status ~= "rebooting" and modem_state.modem and modem_state.modem ~= "unknown"
+if not state_file_exists then
+	status_text = "Service disabled"
+elseif status == "connected" then
+	status_class = "connected"
+	status_text = "Connected"
+elseif status == "connecting" then
+	status_class = "warning"
+	status_text = "Connecting..."
+elseif status == "rebooting" then
+	status_class = "warning"
+	status_text = "Rebooting..."
+elseif status == "sim_absent" then
+	status_class = "error"
+	status_text = "SIM Absent"
+elseif status == "sim_locked" then
+	status_class = "error"
+	status_text = "SIM Locked (PIN/PUK)"
+elseif status == "sim_not_ready" then
+	status_class = "error"
+	status_text = "SIM Not Ready"
+elseif status == "no_modem" then
+	status_class = "error"
+	status_text = "No Modem"
+end
+%>
+<div class="modem-summary">
+	<div class="modem-summary-head">
+		<div class="modem-identity">
+			<span class="modem-summary-label"><%:Modem Status%></span>
+			<div class="modem-name" id="status-modem-name">
+				<% if not state_file_exists then %><%:Service disabled%>
+				<% elseif status == "no_modem" or status == "rebooting" then %>-
+				<% elseif has_modem then %><%=modem_state.modem%>
+				<% else %><%:Not detected%><% end %>
+			</div>
+			<div class="modem-revision" id="status-modem-revision"<% if not has_modem then %> style="display:none"<% end %>><%:Revision%>: <span id="status-modem-revision-value"><%=modem_state.revision or "N/A"%></span></div>
+		</div>
+		<span class="modem-status-badge <%=status_class%>" id="status-modem-badge"><%=status_text%></span>
+	</div>
+	<div class="modem-meta">
+		<div class="modem-meta-item">
+			<span class="modem-meta-label"><%:Mode%></span>
+			<span class="modem-meta-value" id="status-modem-mode"><% if state_file_exists and status ~= "no_modem" and modem_state.mode and modem_state.mode ~= "unknown" then %><%=modem_state.mode%><% else %>-<% end %></span>
+		</div>
+		<div class="modem-meta-item">
+			<span class="modem-meta-label"><%:Temperature%></span>
+			<span class="modem-meta-value" id="status-modem-temperature"><% if modem_state.temperature and modem_state.temperature ~= "" then %><%=modem_state.temperature%> °C<% else %>-<% end %></span>
+		</div>
+	</div>
+</div>
+
+<fieldset class="cbi-section">
+	<legend><%:Watchdog Service Settings%></legend>
+
+	<p><%:Enable or disable the Universal Modem Connection Watchdog.%></p>
+
+	<form method="post" action="<%=luci.dispatcher.build_url("admin", "network", "modemmanager", "save")%>">
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:Enable Service%></label>
+			<div class="cbi-value-field">
+				<input type="checkbox" name="enabled" value="1" <% if uci:get("modemmanager", "main", "enabled") == "1" then %>checked<% end %> />
+			</div>
+		</div>
+
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:Enable IPv6%></label>
+			<div class="cbi-value-field">
+				<input type="checkbox" name="enable_ipv6" value="1" <% if uci:get("modemmanager", "main", "enable_ipv6") == "1" then %>checked<% end %> />
+			</div>
+		</div>
+
+		<div class="cbi-value">
+			<label class="cbi-value-title"><%:Modem Control%></label>
+			<div class="cbi-value-field">
+				<input type="button" class="cbi-button cbi-button-apply" value="<%:Reinit%>" onclick="if(confirm('Reinitialize modem connection?\n\nThis will send AT+CFUN=4 then AT+CFUN=1.\nThe connection will be temporarily interrupted.'))window.location.href='<%=luci.dispatcher.build_url("admin", "network", "modemmanager", "reinit")%>'" />
+				<input type="button" class="cbi-button cbi-button-reset" value="<%:Reboot%>" onclick="if(confirm('Reboot the modem?\n\nThis will send AT+CFUN=1,1 and the modem will restart.\nThe connection will be lost for about 20 seconds.'))window.location.href='<%=luci.dispatcher.build_url("admin", "network", "modemmanager", "reboot")%>'" />
+			</div>
+		</div>
+
+		<div class="cbi-value">
+			<div class="cbi-value-field">
+				<input type="submit" class="cbi-button cbi-button-apply" value="<%:Save & Apply%>" />
+			</div>
+		</div>
+	</form>
+
+</fieldset>
+
+<fieldset class="cbi-section">
+	<legend><%:AT Command Terminal%></legend>
+
+	<div class="cbi-value">
+		<label class="cbi-value-title"><%:Preset Commands%></label>
+		<div class="cbi-value-field">
+			<select id="at-preset" onchange="document.getElementById('at-cmd').value=this.value">
+				<option value="">-- <%:Select command%> --</option>
+				<option value="ATI">ATI</option>
+				<option value="AT+CPIN?">AT+CPIN?</option>
+				<option value="AT+COPS?">AT+COPS?</option>
+				<option value="AT+CFUN?">AT+CFUN?</option>
+				<option value="AT+CGDCONT?">AT+CGDCONT?</option>
+				<option value="AT+GTCCINFO?">AT+GTCCINFO?</option>
+				<option value="AT+GTCAINFO?">AT+GTCAINFO?</option>
+				<option value="AT+MTSM=1">AT+MTSM=1</option>
+				<option value="AT+DEBUG?">AT+DEBUG?</option>
+				<option value="AT+TEMP?">AT+TEMP?</option>
+				<option value='AT+QENG="servingcell"'>AT+QENG="servingcell"</option>
+				<option value="AT+QCAINFO">AT+QCAINFO</option>
+				<option value="AT+QTEMP">AT+QTEMP</option>
+			</select>
+		</div>
+	</div>
+
+	<div class="cbi-value">
+		<label class="cbi-value-title"><%:AT Command%></label>
+		<div class="cbi-value-field">
+			<input type="text" id="at-cmd" class="cbi-input-text" placeholder="e.g. AT+CPIN?" style="width:300px" />
+			<input type="button" class="cbi-button cbi-button-apply" value="<%:Send%>" onclick="sendAT()" />
+		</div>
+	</div>
+
+	<div class="cbi-value">
+		<label class="cbi-value-title"><%:Output%></label>
+		<div class="cbi-value-field">
+			<textarea id="at-output" class="cbi-input-textarea" rows="10" readonly style="width:100%;font-family:monospace;background:#1a1a2e;color:#0f0;border:1px solid #444;padding:8px"></textarea>
+		</div>
+	</div>
+
+</fieldset>
+
+</div><!-- /tab-status -->
+
+<div id="tab-signal" style="display:none">
+	<div class="signal-toolbar">
+		<input type="button" class="cbi-button cbi-button-apply" value="<%:Refresh%>" onclick="loadSignal()" />
+		<label><input type="checkbox" id="signal-autorefresh" /> <%:Auto-refresh%></label>
+		<span id="signal-status" class="signal-updated"></span>
+	</div>
+
+	<div class="signal-summary">
+		<div class="signal-summary-main">
+			<span id="sig-network-mode" class="signal-mode">-</span>
+			<span id="sig-operator" class="signal-operator">-</span>
+		</div>
+		<div class="signal-meta">
+			<div class="signal-meta-item"><span class="signal-meta-label"><%:MCC/MNC%></span><span id="sig-mcc-mnc" class="signal-meta-value">-</span></div>
+			<div class="signal-meta-item"><span class="signal-meta-label"><%:TAC%></span><span id="sig-tac" class="signal-meta-value">-</span></div>
+			<div id="sig-enodeb-item" class="signal-meta-item" style="display:none"><span class="signal-meta-label"><%:eNodeB ID%></span><span id="sig-enodeb-id" class="signal-meta-value">-</span></div>
+			<div id="sig-cell-number-item" class="signal-meta-item" style="display:none"><span class="signal-meta-label"><%:Cell Number%></span><span id="sig-cell-number" class="signal-meta-value">-</span></div>
+			<div class="signal-meta-item"><span class="signal-meta-label"><%:Cell ID%></span><span id="sig-cell-id" class="signal-meta-value">-</span></div>
+		</div>
+	</div>
+
+	<div id="signal-carrier-grid" class="carrier-grid" aria-live="polite"></div>
+	<div id="signal-empty" class="signal-empty">No carrier information available.</div>
+
+</div><!-- /tab-signal -->
+
+<div id="tab-sms" style="display:none">
+	<fieldset class="cbi-section sms-storage">
+		<legend><%:Message Storage%></legend>
+		<div class="sms-storage-grid">
+			<div class="sms-storage-item">
+				<label for="sms-mem1"><%:Read / Delete%></label>
+				<select id="sms-mem1" onchange="resetSmsStorageLabel(this)">
+					<option value="ME" <% if (uci:get("modemmanager", "main", "sms_mem1") or "ME") == "ME" then %>selected<% end %>>ME</option>
+					<option value="MT" <% if uci:get("modemmanager", "main", "sms_mem1") == "MT" then %>selected<% end %>>MT</option>
+					<option value="SM" <% if uci:get("modemmanager", "main", "sms_mem1") == "SM" then %>selected<% end %>>SM</option>
+					<option value="SR" <% if uci:get("modemmanager", "main", "sms_mem1") == "SR" then %>selected<% end %>>SR</option>
+				</select>
+			</div>
+			<div class="sms-storage-item">
+				<label for="sms-mem2"><%:Write / Send%></label>
+				<select id="sms-mem2" onchange="resetSmsStorageLabel(this)">
+					<option value="ME" <% if (uci:get("modemmanager", "main", "sms_mem2") or "ME") == "ME" then %>selected<% end %>>ME</option>
+					<option value="MT" <% if uci:get("modemmanager", "main", "sms_mem2") == "MT" then %>selected<% end %>>MT</option>
+					<option value="SM" <% if uci:get("modemmanager", "main", "sms_mem2") == "SM" then %>selected<% end %>>SM</option>
+					<option value="SR" <% if uci:get("modemmanager", "main", "sms_mem2") == "SR" then %>selected<% end %>>SR</option>
+				</select>
+			</div>
+			<div class="sms-storage-item">
+				<label for="sms-mem3"><%:Receive%></label>
+				<select id="sms-mem3" onchange="resetSmsStorageLabel(this)">
+					<option value="ME" <% if (uci:get("modemmanager", "main", "sms_mem3") or "ME") == "ME" then %>selected<% end %>>ME</option>
+					<option value="MT" <% if uci:get("modemmanager", "main", "sms_mem3") == "MT" then %>selected<% end %>>MT</option>
+					<option value="SM" <% if uci:get("modemmanager", "main", "sms_mem3") == "SM" then %>selected<% end %>>SM</option>
+					<option value="SR" <% if uci:get("modemmanager", "main", "sms_mem3") == "SR" then %>selected<% end %>>SR</option>
+				</select>
+			</div>
+			<div class="sms-storage-action"><input type="button" class="cbi-button cbi-button-save" id="sms-storage-save" value="<%:Save%>" onclick="saveSmsStorage()" /></div>
+		</div>
+	</fieldset>
+	<div class="sms-toolbar">
+		<input type="button" class="cbi-button cbi-button-apply" id="sms-refresh" value="<%:Refresh%>" onclick="loadSms()" />
+		<input type="button" class="cbi-button" id="sms-new" value="<%:New Message%>" onclick="newSmsMessage()" />
+		<span id="sms-status" role="status" aria-live="polite"></span>
+	</div>
+	<div class="sms-layout" id="sms-layout">
+		<div class="sms-senders" id="sms-senders" aria-label="SMS senders"></div>
+		<div class="sms-conversation">
+			<div class="sms-conversation-head">
+				<input type="button" class="cbi-button sms-back" value="<%:Back%>" onclick="smsBack()" />
+				<span class="sms-conversation-title" id="sms-title"><%:Select a conversation%></span>
+			</div>
+			<div class="sms-messages" id="sms-messages"></div>
+			<div class="sms-composer" id="sms-composer">
+				<div class="sms-compose-recipient">
+					<label for="sms-recipient"><%:To%></label>
+					<input type="tel" id="sms-recipient" maxlength="21" placeholder="191 or +84901234567" oninput="updateSmsComposer()" />
+				</div>
+				<div class="sms-compose-message">
+					<textarea id="sms-compose-text" rows="2" placeholder="<%:Message%>" oninput="updateSmsComposer()"></textarea>
+					<div class="sms-compose-actions">
+						<span class="sms-counter" id="sms-counter">0 / 160</span>
+						<input type="button" class="cbi-button cbi-button-apply" id="sms-send" value="<%:Send%>" onclick="sendSms()" />
+					</div>
+				</div>
+				<div class="sms-send-note" id="sms-send-note"></div>
+			</div>
+		</div>
+	</div>
+	<p class="sms-note"><%:Received messages in the modem's current SMS storage. Reading may mark messages as read on the modem.%></p>
+</div><!-- /tab-sms -->
+
+<div id="tab-log" style="display:none">
+
+<fieldset class="cbi-section">
+	<legend><%:Service Log%></legend>
+
+	<div class="cbi-value">
+		<label class="cbi-value-title"><%:Recent Log%></label>
+		<div class="cbi-value-field">
+			<input type="button" class="cbi-button cbi-button-apply" value="<%:Refresh%>" onclick="refreshLog()" />
+		</div>
+	</div>
+
+	<div class="cbi-value">
+		<div class="cbi-value-field">
+			<textarea id="log-output" class="cbi-input-textarea" rows="15" readonly style="width:100%;font-family:monospace;background:#1a1a2e;color:#0f0;border:1px solid #444;padding:8px"></textarea>
+		</div>
+	</div>
+
+</fieldset>
+
+</div><!-- /tab-log -->
+
+<script>
+var signalAutoRefreshTimer = null;
+var signalBusy = false;
+var modemStatusBusy = false;
+var currentTab = 'status';
+var manualAtBusy = false;
+var smsBusy = false;
+var smsRequest = null;
+var smsGeneration = 0;
+var smsUnavailable = false;
+var smsThreads = [];
+var smsSelected = null;
+var smsWaitTimer = null;
+var smsStorage = { mem1: 'ME', mem2: 'ME', mem3: 'ME' };
+var smsSendAvailable = false;
+var smsSendReason = 'Waiting for modem status...';
+var smsSentMessages = [];
+var smsSessionId = '';
+var smsComposeNew = false;
+
+function smsElement(parent, tag, className, text) {
+	var el = document.createElement(tag);
+	el.className = className || '';
+	if (text !== undefined) el.textContent = text;
+	parent.appendChild(el);
+	return el;
+}
+
+function smsTextInfo(text) {
+	var basic = '@£$¥èéùìòÇ\nØø\rÅåΔ_ΦΓΛΩΠΨΣΘΞÆæßÉ !"#¤%&\'()*+,-./0123456789:;<=>?¡ABCDEFGHIJKLMNOPQRSTUVWXYZÄÖÑÜ§¿abcdefghijklmnopqrstuvwxyzäöñüà';
+	var extended = '\f^{}\\[~]|€';
+	var septets = 0;
+	var unicode = false;
+	for (var i = 0; i < text.length; i++) {
+		var code = text.charCodeAt(i);
+		if (code === 0 || (code >= 0xD800 && code <= 0xDFFF))
+			return { encoding: 'unsupported', units: 0, limit: 0, valid: false };
+		if (basic.indexOf(text.charAt(i)) >= 0) septets++;
+		else if (extended.indexOf(text.charAt(i)) >= 0) septets += 2;
+		else unicode = true;
+	}
+	var encoding = unicode ? 'ucs2' : 'gsm7';
+	var units = unicode ? text.length : septets;
+	var limit = unicode ? 70 : 160;
+	return { encoding: encoding, units: units, limit: limit, valid: units > 0 && units <= limit };
+}
+
+function smsSeptetCount(text) {
+	var info = smsTextInfo(text);
+	return info.encoding === 'gsm7' ? info.units : null;
+}
+
+function validSmsRecipient(value) {
+	return /^\+?[0-9]{1,20}$/.test(value);
+}
+
+function updateSmsComposer() {
+	var recipient = document.getElementById('sms-recipient');
+	var message = document.getElementById('sms-compose-text');
+	var send = document.getElementById('sms-send');
+	var counter = document.getElementById('sms-counter');
+	var note = document.getElementById('sms-send-note');
+	var info = smsTextInfo(message.value || '');
+	var validText = info.valid;
+	counter.textContent = info.encoding === 'unsupported' ? 'Unsupported text' :
+		info.units + ' / ' + info.limit + (info.encoding === 'ucs2' ? ' Unicode' : ' GSM-7');
+	counter.className = 'sms-counter' + (!validText && info.units > 0 ? ' invalid' : '');
+	recipient.disabled = !smsSendAvailable || smsBusy;
+	message.disabled = !smsSendAvailable || smsBusy;
+	document.getElementById('sms-new').disabled = !smsSendAvailable || smsBusy;
+	send.disabled = !smsSendAvailable || smsBusy || !validSmsRecipient(recipient.value || '') || !validText;
+	if (!smsSendAvailable) note.textContent = smsSendReason;
+	else if (info.encoding === 'unsupported') note.textContent = 'Emoji and characters outside the UCS-2 range are not supported.';
+	else if (info.units > info.limit) note.textContent = info.encoding === 'ucs2' ?
+		'Shorten the Unicode message to 70 characters.' : 'Shorten the message to 160 septets.';
+	else note.textContent = '';
+}
+
+function localSmsTimestamp(date) {
+	function pad(value) { return String(value).padStart(2, '0'); }
+	var offset = -date.getTimezoneOffset();
+	var sign = offset < 0 ? '-' : '+';
+	offset = Math.abs(offset);
+	return date.getFullYear() + '-' + pad(date.getMonth() + 1) + '-' + pad(date.getDate()) + 'T' +
+		pad(date.getHours()) + ':' + pad(date.getMinutes()) + ':' + pad(date.getSeconds()) +
+		sign + pad(Math.floor(offset / 60)) + ':' + pad(offset % 60);
+}
+
+function newSmsMessage() {
+	if (!smsSendAvailable || smsBusy) return;
+	smsComposeNew = true;
+	smsSelected = null;
+	document.getElementById('sms-recipient').value = '';
+	document.getElementById('sms-layout').classList.add('conversation-open');
+	renderSmsSenders();
+	renderSmsConversation(true);
+	updateSmsComposer();
+	var recipient = document.getElementById('sms-recipient');
+	if (recipient.focus) recipient.focus();
+}
+
+function resetSmsStorageLabel(select) {
+	var options = select.options || select.children || [];
+	for (var i = 0; i < options.length; i++) options[i].textContent = options[i].value;
+}
+
+function applySmsStorage(storage) {
+	var valid = ['ME', 'MT', 'SM', 'SR'];
+	if (!storage || valid.indexOf(storage.mem1) < 0 || valid.indexOf(storage.mem2) < 0 || valid.indexOf(storage.mem3) < 0) return;
+	smsStorage = { mem1: storage.mem1, mem2: storage.mem2, mem3: storage.mem3 };
+	['mem1', 'mem2', 'mem3'].forEach(function(key) {
+		var select = document.getElementById('sms-' + key);
+		resetSmsStorageLabel(select);
+		select.value = storage[key];
+		var usage = storage.usage && storage.usage[key];
+		if (!usage || !Number.isInteger(usage.used) || usage.used < 0 || !Number.isInteger(usage.total) || usage.total < 0) return;
+		var options = select.options || select.children || [];
+		for (var i = 0; i < options.length; i++) {
+			if (options[i].value === storage[key]) {
+				options[i].textContent = storage[key] + ' (' + usage.used + '/' + usage.total + ')';
+				break;
+			}
+		}
+	});
+}
+
+function smsBack() {
+	document.getElementById('sms-layout').classList.remove('conversation-open');
+}
+
+function clearSms(message) {
+	smsGeneration++;
+	if (smsRequest) smsRequest.abort();
+	smsRequest = null;
+	smsBusy = false;
+	clearTimeout(smsWaitTimer);
+	smsWaitTimer = null;
+	smsThreads = [];
+	smsSentMessages = [];
+	smsSelected = null;
+	smsComposeNew = false;
+	document.getElementById('sms-refresh').disabled = false;
+	document.getElementById('sms-storage-save').disabled = false;
+	document.getElementById('sms-status').textContent = message;
+	document.getElementById('sms-senders').textContent = '';
+	document.getElementById('sms-messages').textContent = '';
+	document.getElementById('sms-title').textContent = 'Select a conversation';
+	smsElement(document.getElementById('sms-senders'), 'div', 'sms-empty', message);
+	updateSmsComposer();
+	smsBack();
+}
+
+function renderSmsConversation(resetScroll) {
+	var thread = null;
+	for (var i = 0; i < smsThreads.length; i++) {
+		if (smsThreads[i].sender === smsSelected) { thread = smsThreads[i]; break; }
+	}
+	var pane = document.getElementById('sms-messages');
+	var previousScroll = pane.scrollTop;
+	var atBottom = pane.scrollHeight - pane.clientHeight - pane.scrollTop < 40;
+	pane.textContent = '';
+	document.getElementById('sms-title').textContent = thread ? thread.sender : (smsComposeNew ? 'New message' : 'Select a conversation');
+	if (!thread) {
+		smsElement(pane, 'div', 'sms-empty', smsComposeNew ? 'Enter a recipient and message below.' : 'Choose a sender to read their messages.');
+		return;
+	}
+	var day = '';
+	thread.messages.forEach(function(message) {
+		var stamp = message.timestamp || '';
+		var messageDay = stamp.slice(0, 10);
+		if (messageDay !== day) {
+			smsElement(pane, 'div', 'sms-day', messageDay || 'Unknown date');
+			day = messageDay;
+		}
+		var bubble = smsElement(pane, 'div', 'sms-bubble' + (message.direction === 'outgoing' ? ' outgoing' : ''));
+		smsElement(bubble, 'div', 'sms-text', message.text);
+		if (message.direction !== 'outgoing' && !message.complete) {
+			smsElement(bubble, 'span', 'sms-incomplete', 'Incomplete message (' + message.received_parts + '/' + message.parts + ' parts)');
+		}
+		var footer = smsElement(bubble, 'div', 'sms-bubble-footer');
+		if (message.direction === 'outgoing') smsElement(footer, 'span', 'sms-time', 'Sent');
+		var shownTime = stamp.slice(11).replace(/([+-][0-9]{2}:[0-9]{2})$/, ' UTC$1') || 'Unknown time';
+		var time = smsElement(footer, 'time', 'sms-time', shownTime);
+		time.setAttribute('datetime', stamp);
+		time.title = stamp.replace('T', ' ');
+		var indexes = message.direction === 'outgoing' ? [] : (Array.isArray(message.indexes) ? message.indexes.filter(function(index) { return Number.isInteger(index) && index >= 0; }) : []);
+		if (indexes.length) {
+			var remove = smsElement(footer, 'button', 'sms-delete', 'Delete');
+			remove.type = 'button';
+			remove.disabled = smsBusy;
+			remove.onclick = function() { deleteSms(message, indexes, remove); };
+		}
+	});
+	pane.scrollTop = resetScroll || atBottom ? pane.scrollHeight : previousScroll;
+}
+
+function renderSmsSenders() {
+	var list = document.getElementById('sms-senders');
+	var oldScroll = list.scrollTop;
+	list.textContent = '';
+	if (!smsThreads.length) smsElement(list, 'div', 'sms-empty', 'No messages.');
+	smsThreads.forEach(function(thread) {
+		var latest = thread.messages[thread.messages.length - 1];
+		var button = smsElement(list, 'button', 'sms-sender' + (smsSelected === thread.sender ? ' selected' : ''));
+		button.type = 'button';
+		button.setAttribute('aria-pressed', smsSelected === thread.sender ? 'true' : 'false');
+		smsElement(button, 'span', 'sms-avatar', thread.sender.charAt(0) || '?');
+		var copy = smsElement(button, 'span', 'sms-sender-copy');
+		var line = smsElement(copy, 'span', 'sms-sender-line');
+		smsElement(line, 'span', 'sms-sender-name', thread.sender);
+		smsElement(line, 'time', 'sms-sender-time', latest.timestamp.slice(5, 10));
+		smsElement(copy, 'span', 'sms-preview', latest.text);
+		button.onclick = function() {
+			var changed = smsSelected !== thread.sender;
+			smsComposeNew = false;
+			smsSelected = thread.sender;
+			document.getElementById('sms-recipient').value = /^\+?[0-9]{1,20}$/.test(thread.sender) ? thread.sender : '';
+			document.getElementById('sms-layout').classList.add('conversation-open');
+			renderSmsSenders();
+			renderSmsConversation(changed);
+			updateSmsComposer();
+		};
+	});
+	list.scrollTop = oldScroll;
+}
+
+function loadSms() {
+	if (smsBusy || currentTab !== 'sms') return;
+	if (smsUnavailable) {
+		document.getElementById('sms-status').textContent = 'Modem or SIM unavailable. Refresh after it is ready.';
+		return;
+	}
+	if (signalBusy || manualAtBusy) {
+		document.getElementById('sms-status').textContent = 'Waiting for the current modem query...';
+		clearTimeout(smsWaitTimer);
+		smsWaitTimer = setTimeout(loadSms, 250);
+		return;
+	}
+	clearTimeout(smsWaitTimer);
+	smsWaitTimer = null;
+	smsBusy = true;
+	updateSmsComposer();
+	var generation = smsGeneration;
+	var xhr = new XMLHttpRequest();
+	smsRequest = xhr;
+	document.getElementById('sms-refresh').disabled = true;
+	document.getElementById('sms-storage-save').disabled = true;
+	document.getElementById('sms-status').textContent = 'Reading messages...';
+	xhr.open('POST', '<%=luci.dispatcher.build_url("admin", "network", "modemmanager", "sms")%>', true);
+	xhr.timeout = 55000;
+	xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+
+	function finish(error) {
+		if (generation !== smsGeneration || smsRequest !== xhr) return;
+		smsRequest = null;
+		smsBusy = false;
+		document.getElementById('sms-refresh').disabled = false;
+		document.getElementById('sms-storage-save').disabled = false;
+		updateSmsComposer();
+		var data;
+		if (!error) {
+			try { data = JSON.parse(xhr.responseText); }
+			catch (e) { error = 'Unable to read messages. Try Refresh.'; }
+		}
+		if (data && data.error) error = data.error;
+		if (!error && xhr.status !== 200) error = 'SMS request failed. Try Refresh.';
+		if (!error && (!data || !Array.isArray(data.messages))) error = 'Invalid SMS response. Try Refresh.';
+		if (error) {
+			document.getElementById('sms-status').textContent = error + (smsThreads.length ? ' Showing previously loaded messages.' : '');
+			return;
+		}
+		applySmsStorage(data.storage);
+		var threads = Object.create(null);
+		data.messages.forEach(function(message, index) {
+			if (typeof message.sender !== 'string' || typeof message.text !== 'string' || typeof message.timestamp !== 'string') return;
+			var sender = message.sender || 'Unknown sender';
+			if (!threads[sender]) threads[sender] = { sender: sender, messages: [], latest: index };
+			threads[sender].messages.push(message);
+			threads[sender].latest = index;
+		});
+		smsSentMessages.forEach(function(message, index) {
+			var sender = message.recipient;
+			if (!threads[sender]) threads[sender] = { sender: sender, messages: [], latest: data.messages.length + index };
+			threads[sender].messages.push(message);
+			threads[sender].latest = data.messages.length + index;
+		});
+		smsThreads = Object.keys(threads).map(function(key) { return threads[key]; });
+		smsThreads.sort(function(a, b) { return b.latest - a.latest; });
+		var selectedExists = false;
+		for (var i = 0; i < smsThreads.length; i++) {
+			if (smsThreads[i].sender === smsSelected) { selectedExists = true; break; }
+		}
+		if (!selectedExists) {
+			smsSelected = null;
+			if (!smsComposeNew) smsBack();
+		}
+		renderSmsSenders();
+		renderSmsConversation(false);
+		var warnings = Array.isArray(data.warnings) ? data.warnings.join(' ') : '';
+		document.getElementById('sms-status').textContent = data.messages.length + ' messages · Updated ' + new Date().toLocaleTimeString() + (warnings ? ' · ' + warnings : '');
+	}
+
+	xhr.onload = function() { finish(); };
+	xhr.onerror = function() { finish('SMS request failed. Try Refresh.'); };
+	xhr.ontimeout = function() { finish('SMS request timed out. Try Refresh.'); };
+	xhr.onabort = function() { finish('SMS request cancelled.'); };
+	xhr.send('token=' + encodeURIComponent('<%=token%>'));
+}
+
+function saveSmsStorage() {
+	if (smsBusy || signalBusy || manualAtBusy) return;
+	var mem1 = document.getElementById('sms-mem1').value;
+	var mem2 = document.getElementById('sms-mem2').value;
+	var mem3 = document.getElementById('sms-mem3').value;
+	var valid = ['ME', 'MT', 'SM', 'SR'];
+	if (valid.indexOf(mem1) < 0 || valid.indexOf(mem2) < 0 || valid.indexOf(mem3) < 0) return;
+	smsBusy = true;
+	updateSmsComposer();
+	document.getElementById('sms-refresh').disabled = true;
+	document.getElementById('sms-storage-save').disabled = true;
+	document.getElementById('sms-status').textContent = 'Saving message storage...';
+	var xhr = new XMLHttpRequest();
+	xhr.open('POST', '<%=luci.dispatcher.build_url("admin", "network", "modemmanager", "sms-settings")%>', true);
+	xhr.timeout = 15000;
+	xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+	xhr.onload = function() {
+		smsBusy = false;
+		updateSmsComposer();
+		document.getElementById('sms-refresh').disabled = false;
+		document.getElementById('sms-storage-save').disabled = false;
+		var data;
+		try { data = JSON.parse(xhr.responseText); } catch (e) {}
+		if (xhr.status !== 200 || !data || data.error) {
+			document.getElementById('sms-status').textContent = data && data.error ? data.error : 'Could not save SMS storage settings.';
+			return;
+		}
+		smsStorage = data.storage;
+		loadSms();
+	};
+	xhr.onerror = xhr.ontimeout = function() {
+		smsBusy = false;
+		updateSmsComposer();
+		document.getElementById('sms-refresh').disabled = false;
+		document.getElementById('sms-storage-save').disabled = false;
+		document.getElementById('sms-status').textContent = 'Could not save SMS storage settings.';
+	};
+	xhr.send('token=' + encodeURIComponent('<%=token%>') + '&mem1=' + encodeURIComponent(mem1) + '&mem2=' + encodeURIComponent(mem2) + '&mem3=' + encodeURIComponent(mem3));
+}
+
+function sendSms() {
+	if (smsBusy || signalBusy || manualAtBusy || !smsSendAvailable) return;
+	var recipient = document.getElementById('sms-recipient').value || '';
+	var message = document.getElementById('sms-compose-text').value || '';
+	var textInfo = smsTextInfo(message);
+	if (!validSmsRecipient(recipient) || !textInfo.valid) {
+		updateSmsComposer();
+		return;
+	}
+
+	smsBusy = true;
+	updateSmsComposer();
+	document.getElementById('sms-refresh').disabled = true;
+	document.getElementById('sms-storage-save').disabled = true;
+	document.getElementById('sms-status').textContent = 'Sending message...';
+	var xhr = new XMLHttpRequest();
+	xhr.open('POST', '<%=luci.dispatcher.build_url("admin", "network", "modemmanager", "sms-send")%>', true);
+	xhr.timeout = 30000;
+	xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+
+	function finish(networkError) {
+		smsBusy = false;
+		document.getElementById('sms-refresh').disabled = false;
+		document.getElementById('sms-storage-save').disabled = false;
+		var data;
+		try { data = JSON.parse(xhr.responseText); } catch (e) {}
+		if (networkError || !data || data.error || data.sent !== true) {
+			document.getElementById('sms-status').textContent = data && data.error ? data.error : 'SMS sending failed. Try again.';
+			updateSmsComposer();
+			return;
+		}
+		var sent = {
+			recipient: data.recipient || recipient,
+			sender: data.recipient || recipient,
+			text: message,
+			timestamp: localSmsTimestamp(new Date()),
+			direction: 'outgoing',
+			complete: true,
+			indexes: []
+		};
+		smsSentMessages.push(sent);
+		var thread = null;
+		for (var i = 0; i < smsThreads.length; i++) if (smsThreads[i].sender === sent.recipient) { thread = smsThreads[i]; break; }
+		if (!thread) { thread = { sender: sent.recipient, messages: [], latest: 1000000 + smsSentMessages.length }; smsThreads.unshift(thread); }
+		thread.messages.push(sent);
+		smsComposeNew = false;
+		smsSelected = sent.recipient;
+		document.getElementById('sms-compose-text').value = '';
+		document.getElementById('sms-layout').classList.add('conversation-open');
+		renderSmsSenders();
+		renderSmsConversation(true);
+		document.getElementById('sms-status').textContent = data.warning || 'Message sent.';
+		updateSmsComposer();
+	}
+	xhr.onload = function() { finish(false); };
+	xhr.onerror = xhr.ontimeout = function() { finish(true); };
+	xhr.send('token=' + encodeURIComponent('<%=token%>') + '&recipient=' + encodeURIComponent(recipient) + '&message=' + encodeURIComponent(message));
+}
+
+function deleteSms(message, indexes, button) {
+	if (smsBusy || signalBusy || manualAtBusy || !indexes.length) return;
+	var excerpt = message.text.length > 60 ? message.text.slice(0, 57) + '...' : message.text;
+	if (!confirm('Delete this message from ' + (message.sender || 'Unknown sender') + '?\n\n' + excerpt)) return;
+	smsBusy = true;
+	updateSmsComposer();
+	button.disabled = true;
+	document.getElementById('sms-refresh').disabled = true;
+	document.getElementById('sms-storage-save').disabled = true;
+	document.getElementById('sms-status').textContent = 'Deleting message...';
+	var xhr = new XMLHttpRequest();
+	xhr.open('POST', '<%=luci.dispatcher.build_url("admin", "network", "modemmanager", "sms-delete")%>', true);
+	// Each part has two bounded five-second delete attempts. Scale the request
+	// deadline so a slow multipart SMS is not abandoned after its first parts.
+	xhr.timeout = 15000 + indexes.length * 12000;
+	xhr.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded');
+	function finish(networkError) {
+		smsBusy = false;
+		updateSmsComposer();
+		document.getElementById('sms-refresh').disabled = false;
+		document.getElementById('sms-storage-save').disabled = false;
+		var data;
+		try { data = JSON.parse(xhr.responseText); } catch (e) {}
+		if (networkError || !data) {
+			button.disabled = false;
+			document.getElementById('sms-status').textContent = 'SMS deletion failed. Refresh and try again.';
+			return;
+		}
+		if (data.error) {
+			button.disabled = false;
+			document.getElementById('sms-status').textContent = data.error;
+			return;
+		}
+		document.getElementById('sms-status').textContent = Array.isArray(data.failed) && data.failed.length ? 'Some message parts still could not be deleted after retrying. Refreshing...' : 'Message deleted. Refreshing...';
+		loadSms();
+	}
+	xhr.onload = function() { finish(false); };
+	xhr.onerror = xhr.ontimeout = function() { finish(true); };
+	xhr.send('token=' + encodeURIComponent('<%=token%>') + '&indexes=' + encodeURIComponent(indexes.join(',')) + '&mem1=' + encodeURIComponent(smsStorage.mem1));
+}
+
+function loadModemStatus() {
+	if (modemStatusBusy) return;
+	modemStatusBusy = true;
+	var xhr = new XMLHttpRequest();
+	xhr.open('GET', '<%=luci.dispatcher.build_url("admin", "network", "modemmanager", "status")%>?_=' + Date.now(), true);
+	xhr.onreadystatechange = function() {
+		if (xhr.readyState != 4) return;
+		modemStatusBusy = false;
+		if (xhr.status && xhr.status != 200) return;
+		var data = {};
+		(xhr.responseText || '').split('\n').forEach(function(line) {
+			var m = line.match(/^(\S+?)=(.*)$/);
+			if (m) data[m[1]] = m[2];
+		});
+		var state = data.status || 'unknown';
+		smsUnavailable = ['disabled', 'no_modem', 'rebooting', 'sim_absent', 'sim_locked', 'sim_not_ready'].indexOf(state) !== -1;
+		var nextSession = data.session_id || '';
+		if (smsSessionId && nextSession && smsSessionId !== nextSession) {
+			clearSms('Modem changed. Refresh messages for the new modem.');
+		}
+		smsSessionId = nextSession;
+		if (smsUnavailable && (smsBusy || smsThreads.length || smsWaitTimer)) {
+			clearSms('Modem or SIM unavailable. Refresh after it is ready.');
+		}
+		var atDevice = data.at_device || '';
+		smsSendAvailable = !smsUnavailable && /^\/dev\/ttyUSB[0-9]+$/.test(atDevice);
+		if (smsUnavailable) smsSendReason = 'Modem or SIM unavailable.';
+		else if (/^\/dev\/(mhi_|wwan)/.test(atDevice)) smsSendReason = 'SMS sending is temporarily unavailable for PCIe modems.';
+		else if (!smsSendAvailable) smsSendReason = 'SMS sending requires a confirmed USB AT port.';
+		else smsSendReason = '';
+		updateSmsComposer();
+		var hasModem = state !== 'no_modem' && state !== 'rebooting' && data.modem && data.modem !== 'unknown';
+		var name = hasModem ? data.modem : (state === 'disabled' ? 'Service disabled' : state === 'no_modem' || state === 'rebooting' ? '-' : 'Not detected');
+		var badgeText = 'Unknown';
+		var badgeClass = 'neutral';
+		if (state === 'connected') { badgeText = 'Connected'; badgeClass = 'connected'; }
+		else if (state === 'connecting') { badgeText = 'Connecting...'; badgeClass = 'warning'; }
+		else if (state === 'rebooting') { badgeText = 'Rebooting...'; badgeClass = 'warning'; }
+		else if (state === 'sim_absent') { badgeText = 'SIM Absent'; badgeClass = 'error'; }
+		else if (state === 'sim_locked') { badgeText = 'SIM Locked (PIN/PUK)'; badgeClass = 'error'; }
+		else if (state === 'sim_not_ready') { badgeText = 'SIM Not Ready'; badgeClass = 'error'; }
+		else if (state === 'no_modem') { badgeText = 'No Modem'; badgeClass = 'error'; }
+		else if (state === 'disabled') { badgeText = 'Service disabled'; }
+
+		document.getElementById('status-modem-name').textContent = name;
+		var revision = document.getElementById('status-modem-revision');
+		revision.style.display = hasModem ? '' : 'none';
+		document.getElementById('status-modem-revision-value').textContent = data.revision || 'N/A';
+		var badge = document.getElementById('status-modem-badge');
+		badge.className = 'modem-status-badge ' + badgeClass;
+		badge.textContent = badgeText;
+		document.getElementById('status-modem-mode').textContent = state !== 'disabled' && state !== 'no_modem' && data.mode && data.mode !== 'unknown' ? data.mode : '-';
+		var showTemperature = state !== 'disabled' && state !== 'no_modem' && state !== 'rebooting' && data.temperature;
+		document.getElementById('status-modem-temperature').textContent = showTemperature ? data.temperature + ' °C' : '-';
+	};
+	xhr.send();
+}
+
+function showTab(name) {
+	currentTab = name;
+	var statusTab = document.getElementById('tab-status');
+	var signalTab = document.getElementById('tab-signal');
+	var smsTab = document.getElementById('tab-sms');
+	var logTab = document.getElementById('tab-log');
+	var statusBtn = document.getElementById('tab-btn-status');
+	var signalBtn = document.getElementById('tab-btn-signal');
+	var smsBtn = document.getElementById('tab-btn-sms');
+	var logBtn = document.getElementById('tab-btn-log');
+	statusTab.style.display = 'none';
+	signalTab.style.display = 'none';
+	smsTab.style.display = 'none';
+	logTab.style.display = 'none';
+	statusBtn.className = 'tab';
+	signalBtn.className = 'tab';
+	smsBtn.className = 'tab';
+	logBtn.className = 'tab';
+	if (name === 'signal') {
+		signalTab.style.display = '';
+		signalBtn.className = 'tab active';
+		loadSignal();
+		if (document.getElementById('signal-autorefresh').checked && !signalAutoRefreshTimer) {
+			signalAutoRefreshTimer = setInterval(loadSignal, 10000);
+		}
+	} else if (name === 'sms') {
+		smsTab.style.display = '';
+		smsBtn.className = 'tab active';
+		loadSms();
+	} else if (name === 'log') {
+		logTab.style.display = '';
+		logBtn.className = 'tab active';
+		refreshLog();
+	} else {
+		statusTab.style.display = '';
+		statusBtn.className = 'tab active';
+	}
+	if (name !== 'signal' && signalAutoRefreshTimer) {
+		clearInterval(signalAutoRefreshTimer);
+		signalAutoRefreshTimer = null;
+	}
+}
+
+function sendAT() {
+	var cmd = document.getElementById('at-cmd').value;
+	var output = document.getElementById('at-output');
+	if (!cmd) { output.value = 'Please enter a command'; return; }
+	if (smsBusy || manualAtBusy || signalBusy) { output.value = 'A modem query is in progress. Try again shortly.'; return; }
+	manualAtBusy = true;
+	output.value = 'Sending ' + cmd + '...';
+	var xhr = new XMLHttpRequest();
+	xhr.open('GET', '<%=luci.dispatcher.build_url("admin", "network", "modemmanager", "at")%>?cmd=' + encodeURIComponent(cmd), true);
+	xhr.onreadystatechange = function() {
+		if (xhr.readyState == 4) {
+			manualAtBusy = false;
+			output.value = xhr.responseText || 'No response';
+		}
+	};
+	xhr.send();
+}
+
+function refreshLog() {
+	var output = document.getElementById('log-output');
+	output.value = 'Loading log...';
+	var xhr = new XMLHttpRequest();
+	xhr.open('GET', '<%=luci.dispatcher.build_url("admin", "network", "modemmanager", "log")%>', true);
+	xhr.onreadystatechange = function() {
+		if (xhr.readyState == 4) {
+			output.value = xhr.responseText || 'No log available';
+			output.scrollTop = output.scrollHeight;
+		}
+	};
+	xhr.send();
+}
+
+function toggleSignalAutoRefresh() {
+	var box = document.getElementById('signal-autorefresh');
+	var status = document.getElementById('signal-status');
+	if (box.checked) {
+		status.textContent = 'Auto-refresh ON';
+		status.style.color = '#00cc00';
+		loadSignal();
+		signalAutoRefreshTimer = setInterval(loadSignal, 10000);
+	} else {
+		status.textContent = '';
+		if (signalAutoRefreshTimer) {
+			clearInterval(signalAutoRefreshTimer);
+			signalAutoRefreshTimer = null;
+		}
+	}
+}
+
+function signalValuePresent(value) {
+	return value !== undefined && value !== null && value !== '' && value !== '-' && value !== 'undefined';
+}
+
+function formattedSignalValue(value, unit) {
+	if (!signalValuePresent(value)) return '-';
+	return unit ? value + ' ' + unit : value;
+}
+
+function updateLteCellIdentity(data) {
+	var enodebItem = document.getElementById('sig-enodeb-item');
+	var cellNumberItem = document.getElementById('sig-cell-number-item');
+	var hasEnodeb = signalValuePresent(data.enodeb_id) && signalValuePresent(data.enodeb_id_hex);
+	var hasCellNumber = signalValuePresent(data.cell_number) && signalValuePresent(data.cell_number_hex);
+
+	enodebItem.style.display = hasEnodeb ? '' : 'none';
+	cellNumberItem.style.display = hasCellNumber ? '' : 'none';
+	document.getElementById('sig-enodeb-id').textContent = hasEnodeb ? data.enodeb_id + ' (0x' + data.enodeb_id_hex + ')' : '-';
+	document.getElementById('sig-cell-number').textContent = hasCellNumber ? data.cell_number + ' (0x' + data.cell_number_hex + ')' : '-';
+}
+
+function signalQualityClass(metric, value, isRaw) {
+	if (isRaw || !signalValuePresent(value) || isNaN(value)) return 'quality-neutral';
+	var v = parseFloat(value);
+	switch (metric) {
+		case 'rsrp': return v > -80 ? 'quality-good' : v > -100 ? 'quality-warn' : 'quality-poor';
+		case 'rsrq': return v > -10 ? 'quality-good' : v > -15 ? 'quality-warn' : 'quality-poor';
+		case 'sinr': return v > 20 ? 'quality-good' : v > 10 ? 'quality-warn' : 'quality-poor';
+		default: return 'quality-neutral';
+	}
+}
+
+function appendSignalElement(parent, tag, className, text) {
+	var element = document.createElement(tag);
+	if (className) element.className = className;
+	if (text !== undefined) element.textContent = text;
+	parent.appendChild(element);
+	return element;
+}
+
+function appendMetric(parent, label, metric, value, unit, isRaw) {
+	var box = appendSignalElement(parent, 'div', 'carrier-metric');
+	appendSignalElement(box, 'span', 'metric-label', label);
+	appendSignalElement(box, 'span', 'metric-value ' + signalQualityClass(metric, value, isRaw), formattedSignalValue(value, unit));
+}
+
+function appendDetail(parent, label, value, unit) {
+	var box = appendSignalElement(parent, 'div', 'carrier-detail');
+	appendSignalElement(box, 'span', 'carrier-detail-label', label);
+	appendSignalElement(box, 'span', 'carrier-detail-value', formattedSignalValue(value, unit));
+}
+
+function appendCarrierCard(grid, carrier) {
+	var cardClass = 'carrier-card' + (carrier.state === 'inactive' ? ' inactive' : '');
+	var card = appendSignalElement(grid, 'div', cardClass);
+	var head = appendSignalElement(card, 'div', 'carrier-head');
+	var heading = appendSignalElement(head, 'div');
+	appendSignalElement(heading, 'div', 'carrier-title', carrier.title);
+	if (carrier.subtitle) appendSignalElement(heading, 'div', 'carrier-subtitle', carrier.subtitle);
+
+	var badges = appendSignalElement(head, 'div', 'carrier-badges');
+	if (carrier.state === 'active') appendSignalElement(badges, 'span', 'signal-badge active', 'Active');
+	else if (carrier.state === 'inactive') appendSignalElement(badges, 'span', 'signal-badge inactive', 'Inactive');
+	else appendSignalElement(badges, 'span', 'signal-badge', 'Primary');
+	if (signalValuePresent(carrier.band)) appendSignalElement(badges, 'span', 'signal-badge', carrier.band);
+	if (signalValuePresent(carrier.bandwidth)) appendSignalElement(badges, 'span', 'signal-badge', carrier.bandwidth + ' MHz');
+
+	var metrics = appendSignalElement(card, 'div', 'carrier-metrics');
+	appendMetric(metrics, 'RSRP', 'rsrp', carrier.rsrp, carrier.rsrpRaw ? 'raw' : 'dBm', carrier.rsrpRaw);
+	appendMetric(metrics, 'RSRQ', 'rsrq', carrier.rsrq, 'dB', false);
+	appendMetric(metrics, 'SINR', 'sinr', carrier.sinr, 'dB', false);
+
+	var details = appendSignalElement(card, 'div', 'carrier-details');
+	appendDetail(details, 'PCI', carrier.pci);
+	appendDetail(details, 'Channel', carrier.channel);
+	appendDetail(details, 'RSSI', carrier.rssi, 'dBm');
+}
+
+function renderSignalDashboard(data) {
+	var grid = document.getElementById('signal-carrier-grid');
+	var empty = document.getElementById('signal-empty');
+	while (grid.firstChild) grid.removeChild(grid.firstChild);
+	var cards = 0;
+	var mode = data.network_mode || '';
+	var hasPrimary = signalValuePresent(mode) || signalValuePresent(data.band) || signalValuePresent(data.rsrp) || signalValuePresent(data.rssi) || signalValuePresent(data.pci) || signalValuePresent(data.earfcn);
+
+	if (hasPrimary) {
+		var primaryTitle = mode === 'NR5G-SA' ? '5G NR Primary' : mode === 'WCDMA' ? 'WCDMA Serving Cell' : mode === 'LTE' || mode === 'EN-DC' ? 'LTE Primary' : 'Serving Cell';
+		appendCarrierCard(grid, {
+			title: primaryTitle, state: 'primary', band: data.band, bandwidth: data.bandwidth,
+			rsrp: data.rsrp, rsrq: data.rsrq, sinr: data.sinr, rssi: data.rssi,
+			pci: data.pci, channel: data.earfcn
+		});
+		cards++;
+	}
+
+	var sccCount = parseInt(data.lte_scc_count || '0', 10);
+	if (!isNaN(sccCount)) {
+		for (var i = 1; i <= sccCount; i++) {
+			var prefix = 'lte_scc_' + i + '_';
+			appendCarrierCard(grid, {
+				title: 'LTE SCC' + i, state: data[prefix + 'state'],
+				band: data[prefix + 'band'], bandwidth: data[prefix + 'bandwidth'],
+				rsrp: data[prefix + 'rsrp'], rsrpRaw: data[prefix + 'rsrp_unit'] === 'raw',
+				rsrq: data[prefix + 'rsrq'], sinr: data[prefix + 'sinr'], rssi: data[prefix + 'rssi'],
+				pci: data[prefix + 'pci'], channel: data[prefix + 'channel']
+			});
+			cards++;
+		}
+	}
+
+	var hasNr = signalValuePresent(data.nr_band) || signalValuePresent(data.nr_rsrp) || signalValuePresent(data.nr_pci) || signalValuePresent(data.nr_earfcn);
+	if (hasNr) {
+		appendCarrierCard(grid, {
+			title: '5G NR Secondary', subtitle: 'NSA / PSCell', state: 'active',
+			band: data.nr_band, bandwidth: data.nr_bandwidth,
+			rsrp: data.nr_rsrp, rsrq: data.nr_rsrq, sinr: data.nr_sinr,
+			pci: data.nr_pci, channel: data.nr_earfcn
+		});
+		cards++;
+	}
+
+	empty.style.display = cards ? 'none' : 'block';
+}
+
+function loadSignal() {
+	if (signalBusy || smsBusy || manualAtBusy) return;
+	signalBusy = true;
+	var status = document.getElementById('signal-status');
+	var xhr = new XMLHttpRequest();
+	xhr.open('GET', '<%=luci.dispatcher.build_url("admin", "network", "modemmanager", "signal")%>', true);
+	xhr.onreadystatechange = function() {
+		if (xhr.readyState != 4) return;
+		signalBusy = false;
+		var text = xhr.responseText || '';
+		if (text.match(/^ERROR/)) {
+			document.getElementById('sig-network-mode').textContent = text;
+			document.getElementById('sig-operator').textContent = '-';
+			document.getElementById('sig-mcc-mnc').textContent = '-';
+			document.getElementById('sig-cell-id').textContent = '-';
+			document.getElementById('sig-tac').textContent = '-';
+			updateLteCellIdentity({});
+			renderSignalDashboard({});
+			return;
+		}
+		var data = {};
+		text.split('\n').forEach(function(line) {
+			var m = line.match(/^(\S+?)=(.*)$/);
+			if (m) data[m[1]] = m[2];
+		});
+		document.getElementById('sig-network-mode').textContent = data.network_mode || '-';
+		document.getElementById('sig-operator').textContent = data.operator || '-';
+		document.getElementById('sig-cell-id').textContent = data.cell_id || '-';
+		updateLteCellIdentity(data);
+		var mcc = data.mcc || '';
+		var mnc = data.mnc || '';
+		document.getElementById('sig-mcc-mnc').textContent = (mcc && mnc) ? mcc + ' / ' + mnc : '-';
+		document.getElementById('sig-tac').textContent = data.tac || '-';
+		renderSignalDashboard(data);
+
+		// Update last-refresh timestamp
+		var now = new Date();
+		var ts = now.getHours().toString().padStart(2,'0') + ':' +
+				 now.getMinutes().toString().padStart(2,'0') + ':' +
+				 now.getSeconds().toString().padStart(2,'0');
+		if (document.getElementById('signal-autorefresh').checked) {
+			status.textContent = 'Auto-refresh ON \u00B7 ' + ts;
+			status.style.color = '#00cc00';
+		} else {
+			status.textContent = 'Updated ' + ts;
+			status.style.color = '#888';
+		}
+	};
+	xhr.send();
+}
+
+document.addEventListener('DOMContentLoaded', function() {
+	document.getElementById('signal-autorefresh').addEventListener('change', toggleSignalAutoRefresh);
+	loadModemStatus();
+	setInterval(loadModemStatus, 2000);
+});
+</script>
+
+<%+footer%>

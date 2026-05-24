@@ -1,0 +1,64 @@
+#!/bin/ash
+# modem-reinit — Send AT+CFUN=4 then AT+CFUN=1 and restart modem-manager
+# Called from LuCI "Reinit Connection" button
+
+AT_DEVICES="/dev/wwan0at0 /dev/ttyUSB2 /dev/ttyUSB1 /dev/ttyUSB0 /dev/mhi_DUN /dev/mhi_AT"
+
+detect_at_tool() {
+  if command -v sms_tool_q >/dev/null 2>&1; then
+    echo "sms_tool_q"
+  elif command -v sms_tool >/dev/null 2>&1; then
+    echo "sms_tool"
+  else
+    echo ""
+  fi
+}
+
+detect_at_device() {
+  local tool="$1"
+  for dev in $AT_DEVICES; do
+    [ -c "$dev" ] || continue
+    local resp
+    resp=$("$tool" -D -d "$dev" at "AT" 2>&1)
+    if echo "$resp" | grep -q "OK"; then
+      echo "$dev"
+      return 0
+    fi
+  done
+  return 1
+}
+
+AT_TOOL=$(detect_at_tool)
+if [ -z "$AT_TOOL" ]; then
+  echo "ERROR: No AT tool found (sms_tool / sms_tool_q)"
+  exit 1
+fi
+
+AT_DEVICE=$(detect_at_device "$AT_TOOL")
+if [ -z "$AT_DEVICE" ]; then
+  echo "ERROR: No AT device found"
+  exit 1
+fi
+
+echo "AT device: $AT_DEVICE"
+echo "Stopping modem-manager service..."
+/etc/init.d/modem-manager stop
+sleep 2
+
+echo "Sending AT+CFUN=4 (disable radio)..."
+"$AT_TOOL" -D -d "$AT_DEVICE" at "AT+CFUN=4" 2>&1
+
+echo "Waiting 3 seconds..."
+sleep 3
+
+echo "Sending AT+CFUN=1 (enable radio)..."
+"$AT_TOOL" -D -d "$AT_DEVICE" at "AT+CFUN=1" 2>&1
+
+echo "Waiting 5 seconds for modem to register..."
+sleep 5
+
+echo "Starting modem-manager service..."
+/etc/init.d/modem-manager start
+
+echo "Modem reinit complete."
+exit 0

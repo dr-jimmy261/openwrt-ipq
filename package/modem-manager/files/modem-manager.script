@@ -1,0 +1,2000 @@
+#!/bin/ash
+# Universal Modem Connection Manager — FIXED
+# Supports four modes (auto-detected):
+# AT mode — raw AT commands via sms_tool (FM350, modems without quectel-CM)
+# CM mode — quectel-CM connection manager (Quectel EC2x, EM06, RM5xx, etc.)
+# DHCP mode — generic RNDIS/CDC Ethernet devices managed by kernel DHCP
+# MBIM mode — PCIe MBIM orchestration via umbim
+#
+# Fixes in this version:
+# - read_ip_address: use AT+CGPADDR directly instead of CGCONTRDP (CGCONTRDP often has an empty field 4)
+# - Startup: removed redundant double detect_modem_usb call
+# - Busybox ash compatibility fix
+
+# ─── Configuration ────────────────────────────────────────────────────────────
+AT_DEVICES="/dev/wwan0at0 /dev/ttyUSB2 /dev/ttyUSB1 /dev/ttyUSB0 /dev/mhi_DUN /dev/mhi_AT" # AT command ports (priority order)
+WWAN_IFACES="wwan0_1 usb0 wwan0 rmnet_mhi0.1" # Fallback iface name list
+MODEM_MAC="00:00:11:12:13:14" # MAC of modem data interface (primary detection)
+MBIM_DEVICE="/dev/wwan0mbim0" # Target PCIe MBIM node for orchestration
+APN="v-internet" # Carrier APN
+PDP_CID=1 # PDP context ID (AT mode only)
+PDP_TYPE="IPV4V6" # Default PDP context type (will be dynamically overridden)
+DNS_PRIMARY="8.8.8.8" # Primary DNS fallback
+DNS_SECONDARY="8.8.4.4" # Secondary IPv4 DNS fallback
+DNS6_PRIMARY="2001:4860:4860::8888" # Google Primary IPv6 DNS
+DNS6_SECONDARY="2001:4860:4860::8844" # Google Secondary IPv6 DNS
+UCI_INTERFACE_NAME="Modem" # UCI logical interface name
+UCI_INTERFACE6_NAME="${UCI_INTERFACE_NAME}v6" # UCI IPv6 logical interface name
+PING_TARGET="203.113.131.1"
+PING_INTERVAL=3 # Seconds between watchdog pings
+FAIL_THRESHOLD=15 # Failures before full modem reset
+DHCP_RADIO_RECOVER_THRESHOLD=20 # DHCP failures before CFUN=4 -> CFUN=1 radio cycle
+DHCP_REBOOT_THRESHOLD=30 # DHCP failures before full modem reboot
+PCIE_RECOVER_THRESHOLD=5 # Failures before PCIe single-layer radio cycle recovery
+USB_CM_SOFT_RECOVERY_LIMIT=2 # Failed USB CM radio cycles before hard reset fallback
+AT_RESTART_CMD="AT+CFUN=1,1" # Full modem reset AT command (USB only)
+CM_TOOLS="quectel-CM-M quectel-CM quectel-cm" # quectel-CM candidates (priority order)
+LOG_FILE="/tmp/modem-watchdog.log"
+AT_RETRY=5 # Max retries per AT command
+
+# ─── Fibocom AT-mode VID:PID override ────────────────────────────────────────
+FIBOCOM_AT_VIDS="0e8d:7127 0e8d:7126" # FM350-GL and FM350 — rndis_host but needs AT+CGACT
+DETECTED_MODEM_NAME="" # Set by detect_modem_usb
+
+# ─── Runtime state ────────────────────────────────────────────────────────────
+AT_DEVICE="" # Confirmed AT command port
+WWAN_IFACE="" # Confirmed data interface name
+CM_TOOL="" # Detected quectel-CM binary (empty = AT mode)
+AT_TOOL="" # Detected AT command tool: sms_tool or sms_tool_q
+MODE="" # "AT", "CM", "DHCP", or "MBIM" — set during init
+ASSIGNED_IP="" # IP from AT+CGPADDR (AT mode only)
+ASSIGNED_MASK="255.255.255.0"
+ASSIGNED_GW=""
+ASSIGNED_IP6="" # IPv6 address from AT+CGPADDR (AT mode only)
+FAIL_COUNT=0
+SIM_STATE="UNKNOWN" # Last known SIM state: READY, ABSENT, PIN, UNKNOWN
+STATUS="no_modem" # LuCI display: no_modem, rebooting, sim_absent, sim_locked, connecting, connected
+ATI_REVISION="" # Firmware revision from ATI response
+TEMPERATURE="" # Modem temperature in °C
+TEMP_TICK=0 # Counter for periodic temperature queries
+USB_CM_SOFT_RECOVERY_COUNT=0 # Consecutive USB CM radio cycles without restored connectivity
+MODEM_SESSION_SERIAL=0
+MODEM_SESSION_ID="$(date +%s)-$$-$MODEM_SESSION_SERIAL"
+STATE_TMP="/tmp/modem-state.$$"
+AT_LOCK="/tmp/modem-at.lock"
+AT_LOCK_OWNED=0
+
+# ─── Logging ──────────────────────────────────────────────────────────────────
+log() {
+  echo "$(date '+%Y-%m-%d %H:%M:%S') - $1" | tee -a "$LOG_FILE" | logger -t modem
+}
+
+# ─── Single-instance guard ────────────────────────────────────────────────────
+PIDFILE="/tmp/modem-watchdog.pid"
+if [ -f "$PIDFILE" ]; then
+  OLD_PID=$(cat "$PIDFILE")
+  if [ -n "$OLD_PID" ] && [ -d "/proc/$OLD_PID" ]; then
+    OLD_STATE=$(awk '{print $3}' "/proc/$OLD_PID/stat" 2>/dev/null)
+    if [ "$OLD_STATE" = "Z" ]; then
+      echo "WARNING: Removing stale PID file for zombie process $OLD_PID."
+      rm -f "$PIDFILE"
+    elif kill -0 "$OLD_PID" 2>/dev/null; then
+      echo "INFO: Killing old instance (PID $OLD_PID)..."
+      kill "$OLD_PID" 2>/dev/null
+      sleep 1
+      kill -9 "$OLD_PID" 2>/dev/null
+      rm -f "$PIDFILE"
+    else
+      rm -f "$PIDFILE"
+    fi
+  else
+    rm -f "$PIDFILE"
+  fi
+fi
+echo $$ > "$PIDFILE"
+
+cleanup_pidfile() {
+  at_lock_release
+  rm -f "$PIDFILE"
+  rm -f "$STATE_TMP"
+}
+
+cleanup() {
+  log "Script stopping. Cleaning up..."
+  [ "$MODE" = "CM" ] && kill_cm_processes 2>/dev/null
+  cleanup_pidfile
+  exit 0
+}
+trap cleanup INT TERM
+trap cleanup_pidfile EXIT
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STATE FILE (for LuCI)
+# ══════════════════════════════════════════════════════════════════════════════
+
+write_state_file() {
+  local state_modem="${DETECTED_MODEM_NAME:-unknown}"
+  local state_revision="${ATI_REVISION:-unknown}"
+  local state_temperature="$TEMPERATURE"
+  case "$STATUS" in
+    no_modem|rebooting)
+      state_modem="unknown"
+      state_revision="unknown"
+      state_temperature=""
+      ;;
+  esac
+  cat > "$STATE_TMP" <<EOF
+modem=${state_modem}
+mode=$MODE
+apn=$APN
+at_device=$AT_DEVICE
+status=$STATUS
+revision=${state_revision}
+temperature=${state_temperature}
+session_id=${MODEM_SESSION_ID}
+EOF
+  mv -f "$STATE_TMP" /tmp/modem-state
+}
+
+begin_modem_session() {
+  MODEM_SESSION_SERIAL=$((MODEM_SESSION_SERIAL + 1))
+  MODEM_SESSION_ID="$(date +%s)-$$-$MODEM_SESSION_SERIAL"
+}
+
+at_lock_acquire() {
+  local owner
+  [ "$AT_LOCK_OWNED" = 1 ] && return 0
+  if ! mkdir "$AT_LOCK" 2>/dev/null; then
+    owner=$(cat "$AT_LOCK/pid" 2>/dev/null)
+    case "$owner" in
+      ""|*[!0-9]*)
+        # Allow a concurrent owner time to publish its PID before deciding
+        # that an incomplete lock is stale.
+        sleep 1
+        owner=$(cat "$AT_LOCK/pid" 2>/dev/null)
+        ;;
+    esac
+    if [ -n "$owner" ] && kill -0 "$owner" 2>/dev/null; then
+      return 1
+    fi
+    rm -f "$AT_LOCK/pid"
+    rmdir "$AT_LOCK" 2>/dev/null
+    mkdir "$AT_LOCK" 2>/dev/null || return 1
+  fi
+  printf '%s\n' "$$" > "$AT_LOCK/pid" || {
+    rm -f "$AT_LOCK/pid"
+    rmdir "$AT_LOCK" 2>/dev/null
+    return 1
+  }
+  AT_LOCK_OWNED=1
+}
+
+at_lock_wait() {
+  local seconds="${1:-10}" waited=0
+  while ! at_lock_acquire; do
+    [ "$waited" -ge "$seconds" ] && return 1
+    sleep 1
+    waited=$((waited + 1))
+  done
+}
+
+at_lock_release() {
+  local owner
+  [ "$AT_LOCK_OWNED" = 1 ] || return 0
+  owner=$(cat "$AT_LOCK/pid" 2>/dev/null)
+  if [ "$owner" = "$$" ]; then
+    rm -f "$AT_LOCK/pid"
+    rmdir "$AT_LOCK" 2>/dev/null
+  fi
+  AT_LOCK_OWNED=0
+}
+
+at_transaction_active() {
+  local owner
+  [ -d "$AT_LOCK" ] || return 1
+  owner=$(cat "$AT_LOCK/pid" 2>/dev/null)
+  case "$owner" in ""|*[!0-9]*) return 0;; esac
+  kill -0 "$owner" 2>/dev/null
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# AT COMMAND LAYER
+# ══════════════════════════════════════════════════════════════════════════════
+
+at_cmd_raw() {
+  local dev="$1" cmd="$2"
+  "$AT_TOOL" -D -d "$dev" at "$cmd" 2>&1
+}
+
+at_cmd() {
+  local dev="$1" cmd="$2" acquired=0 status
+  if [ "$AT_LOCK_OWNED" != 1 ]; then
+    at_lock_acquire || return 75
+    acquired=1
+  fi
+  at_cmd_raw "$dev" "$cmd"
+  status=$?
+  [ "$acquired" = 1 ] && at_lock_release
+  return "$status"
+}
+
+at_expect() {
+  local dev="$1" cmd="$2" expect="$3"
+  at_cmd "$dev" "$cmd" | grep -q "$expect"
+}
+
+at_retry() {
+  local dev="$1" cmd="$2" expect="$3"
+  local retries="${4:-$AT_RETRY}" delay="${5:-2}" i=0
+  while [ $i -lt $retries ]; do
+    modem_present || return 1
+    at_expect "$dev" "$cmd" "$expect" && return 0
+    i=$((i + 1))
+    log "AT retry $i/$retries: $cmd"
+    sleep "$delay"
+  done
+  return 1
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MODEM PRESENCE CHECK
+# ══════════════════════════════════════════════════════════════════════════════
+
+modem_present() {
+  if [ -n "$AT_DEVICE" ] && [ -c "$AT_DEVICE" ]; then
+    return 0
+  fi
+  for dev in $AT_DEVICES; do
+    [ -c "$dev" ] && return 0
+  done
+  return 1
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DEVICE / INTERFACE DETECTION
+# ══════════════════════════════════════════════════════════════════════════════
+
+detect_at_device() {
+  if [ -n "$AT_DEVICE" ] && [ -c "$AT_DEVICE" ]; then
+    at_expect "$AT_DEVICE" "AT" "OK" && return 0
+    log "AT device $AT_DEVICE no longer responding. Re-scanning..."
+    AT_DEVICE=""
+  fi
+  for dev in $AT_DEVICES; do
+    [ -c "$dev" ] || continue
+    log "Probing $dev..."
+    local resp
+    resp=$(at_cmd "$dev" "AT")
+    if echo "$resp" | grep -q "OK"; then
+      AT_DEVICE="$dev"
+      log "AT port confirmed: $AT_DEVICE"
+      return 0
+    fi
+  done
+  return 1
+}
+
+detect_wwan_iface() {
+  local target_mac
+  target_mac=$(echo "$MODEM_MAC" | tr '[:upper:]' '[:lower:]')
+
+  if [ -n "$target_mac" ]; then
+    for path in /sys/class/net/*/address; do
+      [ -f "$path" ] || continue
+      local mac iface
+      mac=$(tr '[:upper:]' '[:lower:]' < "$path" 2>/dev/null)
+      iface=${path#/sys/class/net/}
+      iface=${iface%/address}
+      if [ "$mac" = "$target_mac" ]; then
+        WWAN_IFACE="$iface"
+        log "WWAN interface detected by MAC ($MODEM_MAC): $WWAN_IFACE"
+        return 0
+      fi
+    done
+    log "MAC $MODEM_MAC not found, trying name list..."
+  fi
+
+  for iface in $WWAN_IFACES; do
+    if ip link show "$iface" >/dev/null 2>&1; then
+      WWAN_IFACE="$iface"
+      log "WWAN interface detected by name: $WWAN_IFACE"
+      return 0
+    fi
+  done
+  return 1
+}
+
+wait_for_at_device() {
+  local retries=0
+  while ! detect_at_device; do
+    retries=$((retries + 1))
+    if [ $retries -ge 10 ]; then
+      log "ERROR: No AT device after $retries attempts. Modem may be unplugged."
+      return 1
+    fi
+    modem_present || { log "Modem removed. Aborting wait."; return 1; }
+    log "No AT device found. Retrying in 5s... ($retries/10)"
+    echo 1 > /sys/bus/pci/rescan 2>/dev/null
+    sleep 5
+  done
+}
+
+wait_for_pcie_at_reenumeration() {
+  local waited=0
+  while [ $waited -lt 60 ]; do
+    if detect_at_device; then
+      log "PCIe AT port re-enumeration complete: AT=$AT_DEVICE"
+      return 0
+    fi
+
+    waited=$((waited + 5))
+    log "Waiting for PCIe AT port to re-enumerate... (${waited}s/60s)"
+    echo 1 > /sys/bus/pci/rescan 2>/dev/null
+    sleep 5
+  done
+
+  log "ERROR: PCIe AT port did not re-enumerate within 60s."
+  return 1
+}
+
+wait_for_wwan_iface() {
+  local retries=0
+  while ! detect_wwan_iface; do
+    retries=$((retries + 1))
+    if [ $retries -ge 10 ]; then
+      log "ERROR: No WWAN interface after $retries attempts. Modem may be unplugged."
+      return 1
+    fi
+    modem_present || { log "Modem removed. Aborting wait."; return 1; }
+    log "No WWAN interface found, waiting... ($retries/10)"
+    for iface in $WWAN_IFACES; do
+      ip link set "$iface" up 2>/dev/null
+    done
+    sleep 3
+  done
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# AT TOOL DETECTION
+# ══════════════════════════════════════════════════════════════════════════════
+
+detect_at_tool() {
+  if command -v sms_tool_q >/dev/null 2>&1; then
+    AT_TOOL="sms_tool_q"
+  elif command -v sms_tool >/dev/null 2>&1; then
+    AT_TOOL="sms_tool"
+  else
+    log "ERROR: Neither sms_tool_q nor sms_tool found. Cannot send AT commands."
+    exit 1
+  fi
+  log "AT tool: $AT_TOOL"
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TEMPERATURE QUERY (per-vendor, periodic)
+# ══════════════════════════════════════════════════════════════════════════════
+
+parse_quectel_temperature() {
+  local response="$1" preferred
+
+  # Prefer the application-processor sensor. Validate the quoted value so
+  # digits in sensor names (cpu0, pa1, etc.) can never become temperatures.
+  preferred=$(printf '%s\n' "$response" | awk -F'"' '
+    /^\+QTEMP:/ && $2 == "cpu0-a7-usr" {
+      value = $4
+      numeric = value + 0
+      if (value ~ /^-?[0-9]+([.][0-9]+)?$/ && numeric > 10 && numeric < 110) {
+        print value
+        exit
+      }
+    }
+  ')
+  if [ -n "$preferred" ]; then
+    printf '%s\n' "$preferred"
+    return 0
+  fi
+
+  # Compatibility fallback for Quectel firmware without cpu0-a7-usr. Read
+  # only the final value field, supporting quoted and unquoted QTEMP layouts.
+  printf '%s\n' "$response" | awk -F'"' '
+    /^\+QTEMP:/ {
+      if (NF >= 4) {
+        value = $4
+      } else {
+        value = $0
+        if (index(value, ",")) {
+          count = split(value, fields, ",")
+          value = fields[count]
+        } else {
+          count = split(value, fields, ":")
+          value = fields[count]
+        }
+      }
+      gsub(/[[:space:]\r]/, "", value)
+      numeric = value + 0
+      if (value ~ /^-?[0-9]+([.][0-9]+)?$/ && numeric > 10 && numeric < 110) {
+        print value
+        exit
+      }
+    }
+  '
+}
+
+query_temperature() {
+  local t=""
+  # This is optional polling: skip the cycle immediately if another complete
+  # SMS, signal or manual transaction owns the AT port.
+  at_lock_acquire || return 0
+  case "$DETECTED_MODEM_NAME" in
+    *Quectel*|*RM5*|*EC2*|*EM06*|*EM12*|*EM16*|*RG5*|*RG2*)
+      local resp
+      resp=$(at_cmd_raw "$AT_DEVICE" "AT+QTEMP")
+      t=$(parse_quectel_temperature "$resp")
+      ;;
+    *FM350*)
+      local resp raw_temp
+      resp=$(at_cmd_raw "$AT_DEVICE" "AT+GTSENRDTEMP=2")
+      raw_temp=$(echo "$resp" | grep -E '^\+GTSENRDTEMP:[[:space:]]*2,' | head -1 | awk -F',' '{print $2}' | tr -d ' \r\n')
+      t=$(awk -v raw="$raw_temp" 'BEGIN { if (raw ~ /^[0-9]+$/ && raw > 0) printf "%.1f", raw / 1000 }')
+      if [ -z "$t" ]; then
+        resp=$(at_cmd_raw "$AT_DEVICE" "AT+MTSM=1,6")
+        t=$(echo "$resp" | grep '+MTSM:' | awk -F': ' '{print $2}' | tr -d ' \r\n')
+        [ -z "$t" ] && resp=$(at_cmd_raw "$AT_DEVICE" "AT+MTSM=1") && t=$(echo "$resp" | grep '+MTSM:' | awk -F': ' '{print $2}' | tr -d ' \r\n')
+      fi
+      ;;
+    *FM150*|*FM160*|*Fibocom*)
+      local resp
+      resp=$(at_cmd_raw "$AT_DEVICE" "AT+MTSM=1,6")
+      t=$(echo "$resp" | grep '+MTSM:' | awk -F': ' '{print $2}' | tr -d ' \r\n')
+      [ -z "$t" ] && resp=$(at_cmd_raw "$AT_DEVICE" "AT+MTSM=1") && t=$(echo "$resp" | grep '+MTSM:' | awk -F': ' '{print $2}' | tr -d ' \r\n')
+      ;;
+    *Sierra*|*EM74*)
+      local resp
+      resp=$(at_cmd_raw "$AT_DEVICE" "AT!PCTEMP?")
+      t=$(echo "$resp" | grep -oE 'Temperature: [0-9]+\.[0-9]+' | grep -oE '[0-9]+\.[0-9]+' | head -1 | tr -d '\r\n')
+      ;;
+    *T99W373*|*T99W640*|*DP25*|*FDE*)
+      local pre="AT^"
+      case "$DETECTED_MODEM_NAME" in *T99W640*|*DP25*) pre="AT+" ;; esac
+      local resp
+      resp=$(at_cmd_raw "$AT_DEVICE" "${pre}TEMP?")
+      t=$(echo "$resp" | sed -n 's/.*TSENS: \([0-9]*\)C.*/\1/p' | tr -d '\r\n')
+      ;;
+    *)
+      local resp
+      resp=$(at_cmd_raw "$AT_DEVICE" "AT+TEMP")
+      t=$(echo "$resp" | grep -E 'TEMP: "cpuss-0-usr"' | awk -F'"' '{print $4}' | head -1 | tr -d ' \r\n')
+      ;;
+  esac
+  [ -n "$t" ] && TEMPERATURE="$t"
+  at_lock_release
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MODEM DETECTION v2 — Improved for OpenWrt + Qualcomm SDX55
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ─── Qualcomm MHI driver names ─────────────────────────────────────────────
+QUALCOMM_MHI_DRIVERS="mhi_q pcie_mhi mhi_pci"
+
+# ─── Qualcomm PCIe VID:PID pairs ───────────────────────────────────────────
+QUALCOMM_PCIE_VIDS="17cb:0306 17cb:0304 17cb:0308"
+
+# ─── MediaTek MBIM VID:PID (FM350-GL) ─────────────────────────────────────
+MEDIATEK_MBIM_VIDS="14c3:4d75 0d40:4d75"
+
+# ─── PCI helpers ───────────────────────────────────────────────────────────
+_pci_info() {
+  lspci -k 2>/dev/null
+}
+
+_pci_nn() {
+  lspci -nn 2>/dev/null
+}
+
+_pci_match_vidpid() {
+  local target="$1"
+  _pci_nn | grep -qi "$target"
+}
+
+_pci_get_modem_driver() {
+  _pci_info | awk '
+  /Class \[ff00\]|Unassigned class \[ff00\]/ { found=1; next }
+  found && /Kernel driver in use:/ { print $NF; found=0; exit }
+  '
+}
+
+_pci_get_modem_desc() {
+  _pci_info | awk '
+  /Class \[ff00\]|Unassigned class \[ff00\]|SDX[0-9]|Snapdragon/ {
+    gsub(/^[0-9a-f]+\.[0-9a-f]+ /, "");
+    print;
+    exit
+  }
+  '
+}
+
+# ─── USB helpers ───────────────────────────────────────────────────────────
+_usb_all_devnums() {
+  lsusb 2>/dev/null | awk '{gsub(/:/, "", $4); print $4+0}'
+}
+
+_sysfs_for_devnum() {
+  local target="$1"
+  for devpath in /sys/bus/usb/devices/[0-9]*; do
+    [ -d "$devpath" ] || continue
+    local dn
+    dn=$(cat "$devpath/devnum" 2>/dev/null)
+    [ "$dn" = "$target" ] && echo "$devpath" && return 0
+  done
+  return 1
+}
+
+_drivers_for_devnum() {
+  local devpath
+  devpath=$(_sysfs_for_devnum "$1")
+  [ -z "$devpath" ] && return 1
+  [ -L "$devpath/driver" ] && basename "$(readlink -f "$devpath/driver")" 2>/dev/null
+  for intf in "$devpath"/*/driver; do
+    [ -L "$intf" ] || continue
+    basename "$(readlink -f "$intf")" 2>/dev/null
+  done | sort -u
+}
+
+_vidpid_for_devnum() {
+  local devpath
+  devpath=$(_sysfs_for_devnum "$1")
+  if [ -n "$devpath" ]; then
+    local vid pid
+    vid=$(cat "$devpath/idVendor" 2>/dev/null)
+    pid=$(cat "$devpath/idProduct" 2>/dev/null)
+    [ -n "$vid" ] && [ -n "$pid" ] && echo "${vid}:${pid}" && return 0
+  fi
+  lsusb 2>/dev/null | grep "Device $1:" | grep -oE '[0-9a-f]{4}:[0-9a-f]{4}' | head -1
+}
+
+_is_fibocom_at() {
+  echo " $FIBOCOM_AT_VIDS " | grep -q " $1 "
+}
+
+normalize_usb_product_name() {
+  local name
+  name=$(printf '%s' "$1" |
+    tr -d '\r\n' |
+    sed 's/[[:space:]]*Modem_SN:.*$//;s/[[:space:]]*SN:.*$//;s/^[[:space:]]*//;s/[[:space:]]*$//')
+  printf '%s\n' "${name:-unknown USB device}"
+}
+
+# ─── sysfs PCI helper ─────────────────────────────────────────────────────
+_sysfs_pci_class_ff00() {
+  for devpath in /sys/bus/pci/devices/*; do
+    [ -d "$devpath" ] || continue
+    local class
+    class=$(cat "$devpath/class" 2>/dev/null)
+    case "$class" in
+      0xff*)
+        local bdf=$(basename "$devpath")
+        local vid=$(cat "$devpath/vendor" 2>/dev/null)
+        local pid=$(cat "$devpath/device" 2>/dev/null)
+        local drv=""
+        [ -L "$devpath/driver" ] && drv=$(basename "$(readlink -f "$devpath/driver")" 2>/dev/null)
+        echo "$bdf ${vid#0x}:${pid#0x} $drv $class"
+        ;;
+    esac
+  done
+}
+
+# ─── sysfs USB helper ─────────────────────────────────────────────────────
+_sysfs_usb_list() {
+  for devpath in /sys/bus/usb/devices/[0-9]*; do
+    [ -d "$devpath" ] || continue
+    local dn vid pid prod drv=""
+    dn=$(cat "$devpath/devnum" 2>/dev/null)
+    vid=$(cat "$devpath/idVendor" 2>/dev/null)
+    pid=$(cat "$devpath/idProduct" 2>/dev/null)
+    prod=$(cat "$devpath/product" 2>/dev/null)
+    [ -L "$devpath/driver" ] && drv=$(basename "$(readlink -f "$devpath/driver")" 2>/dev/null)
+    [ -z "$dn" ] && continue
+    local vidpid="${vid}:${pid}"
+    local intf_drvs=""
+    for intf in "$devpath"/*/driver; do
+      [ -L "$intf" ] || continue
+      intf_drvs="$intf_drvs $(basename "$(readlink -f "$intf")" 2>/dev/null)"
+    done
+    intf_drvs=$(echo $intf_drvs | tr ' ' '\n' | sort -u | tr '\n' ' ')
+    echo "$dn|$vidpid|$drv|$intf_drvs|$prod"
+  done
+}
+
+# ─── detect_modem_usb — main detection logic ──────────────────────────────
+detect_modem_usb() {
+  local detected_driver=""
+  local detected_desc=""
+
+  # ── Tool availability check ────────────────────────────────────────────
+  local has_lspci=0 has_lsusb=0
+  command -v lspci >/dev/null 2>&1 && has_lspci=1
+  command -v lsusb >/dev/null 2>&1 && has_lsusb=1
+  log "detect_modem_usb: tools available — lspci=$has_lspci lsusb=$has_lsusb"
+
+  # ── Branch A: Check Qualcomm MHI (PCIe via lspci) ─────────────────────
+  if [ $has_lspci -eq 1 ]; then
+    detected_driver=$(_pci_get_modem_driver)
+    detected_desc=$(_pci_get_modem_desc)
+    log "detect_modem_usb: PCI scan — driver='$detected_driver' desc='$detected_desc'"
+
+    for mhi_drv in $QUALCOMM_MHI_DRIVERS; do
+      if [ "$detected_driver" = "$mhi_drv" ]; then
+        if _pci_match_vidpid "17cb:0306"; then
+          DETECTED_MODEM_NAME="Qualcomm SDX55 [Snapdragon X55 5G] (PCIe MHI)"
+        elif _pci_match_vidpid "17cb:0308"; then
+          DETECTED_MODEM_NAME="Qualcomm SDX62 [Snapdragon X62 5G] (PCIe MHI)"        
+		elif _pci_match_vidpid "17cb:0309"; then
+          DETECTED_MODEM_NAME="Qualcomm SDX72 [Snapdragon X72 5G] (PCIe MHI)"
+        else
+          DETECTED_MODEM_NAME="Qualcomm PCIe Modem ($mhi_drv)"
+        fi
+
+        MODE="CM"
+        log "Detected: $DETECTED_MODEM_NAME | driver=$mhi_drv"
+
+        if ! _detect_cm_binary; then
+          log "ERROR: Qualcomm PCIe modem detected but no quectel-CM binary found."
+          return 1
+        fi
+
+		# AT_DEVICE is still empty here — detect_modem_usb() runs before
+		# wait_for_at_device() in the startup sequence. The MHI AT port
+		# (mhi_DUN) can take 20-30s+ to enumerate after PCI bind, so a
+		# single-shot probe is too eager; retry with a bounded window.
+		if [ -z "$AT_DEVICE" ] || ! [ -c "$AT_DEVICE" ]; then
+			local at_wait=0
+			until detect_at_device; do
+				at_wait=$((at_wait + 5))
+				if [ $at_wait -ge 60 ]; then
+					log "WARNING: No AT port after ${at_wait}s for T99W373 probe. Skipping check."
+					return 0
+				fi
+				log "Waiting for AT port to probe module... (${at_wait}s)"
+				sleep 5
+			done
+		fi
+
+		local ati_check ati_tries=0 t99w373=0
+		while [ $ati_tries -lt 5 ]; do
+			ati_check=$(at_cmd "$AT_DEVICE" "ATI")
+			log "ATI probe raw response: $(echo "$ati_check" | tr '\r\n' ' ')"
+			# Foxconn T99W373: match model string OR FDE.* firmware marker.
+			# VID:PID 17cb:0308 collides with Quectel SDX62, so also match FW.
+			if echo "$ati_check" | grep -Eq "T99W373|T99W640|FDE"; then
+				t99w373=1
+				break
+			fi
+			ati_tries=$((ati_tries + 1))
+			[ $ati_tries -lt 5 ] && sleep 1
+		done
+
+		# Extract modem model from ATI response (fallback: keep existing DETECTED_MODEM_NAME)
+		local ati_model
+		ati_model=$(echo "$ati_check" | grep '^Model:' | awk '{print $2}')
+		if [ -n "$ati_model" ]; then
+			DETECTED_MODEM_NAME="$ati_model"
+			log "Modem model from ATI: $DETECTED_MODEM_NAME"
+		fi
+
+		if [ "$t99w373" = "1" ]; then
+			log "Foxconn T99W373/T99W640 detected. Keeping CM mode and enabling the PCIe MBIM channel..."
+			MODE="CM"
+			AT_DEVICE=""
+			WWAN_IFACE=""
+			rmmod pcie_mhi 2>/dev/null
+			sleep 10
+			insmod pcie_mhi.ko mhi_mbim_enabled=1 2>/dev/null
+			wait_for_pcie_at_reenumeration || return 1
+		fi
+
+		return 0
+      fi
+    done
+
+    # ── Branch B: MediaTek MBIM (FM350-GL PCIe) ───────────────────────────
+    for vidpid in $MEDIATEK_MBIM_VIDS; do
+      if _pci_match_vidpid "$vidpid"; then
+        if [ -c "$MBIM_DEVICE" ]; then
+          MODE="MBIM"
+          DETECTED_MODEM_NAME="Fibocom FM350-GL 5G (PCIe MBIM Mode)"
+          log "Detected: $DETECTED_MODEM_NAME | VID:PID=$vidpid"
+          return 0
+        else
+          log "MediaTek modem found ($vidpid) but MBIM device $MBIM_DEVICE not available."
+        fi
+      fi
+    done
+
+  else
+    # ── Branch A2: sysfs PCI fallback (no lspci) ─────────────────────────
+    log "detect_modem_usb: lspci not available, scanning sysfs PCI..."
+    local pci_devs
+    pci_devs=$(_sysfs_pci_class_ff00)
+    if [ -n "$pci_devs" ]; then
+      log "detect_modem_usb: sysfs PCI class ff00 devices:"
+      echo "$pci_devs" | while read -r bdf vidpid drv class; do
+        log "  $bdf vid:pid=$vidpid driver=$drv class=$class"
+      done
+
+      for devpath in /sys/bus/pci/devices/*; do
+        [ -d "$devpath" ] || continue
+        local class=$(cat "$devpath/class" 2>/dev/null)
+        case "$class" in 0xff*) ;; *) continue ;; esac
+        local vid=$(cat "$devpath/vendor" 2>/dev/null)
+        local pid=$(cat "$devpath/device" 2>/dev/null)
+        local vidpid="${vid#0x}:${pid#0x}"
+        local drv=""
+        [ -L "$devpath/driver" ] && drv=$(basename "$(readlink -f "$devpath/driver")" 2>/dev/null)
+
+        for mhi_drv in $QUALCOMM_MHI_DRIVERS; do
+          if [ "$drv" = "$mhi_drv" ]; then
+            for qpid in $QUALCOMM_PCIE_VIDS; do
+              if [ "$vidpid" = "$qpid" ]; then
+                case "$qpid" in
+                  17cb:0306) DETECTED_MODEM_NAME="Qualcomm SDX55 [Snapdragon X55 5G] (PCIe MHI)" ;;
+                  17cb:0308) DETECTED_MODEM_NAME="Qualcomm SDX62 [Snapdragon X62 5G] (PCIe MHI)" ;;
+                  17cb:0309) DETECTED_MODEM_NAME="Qualcomm SDX72 [Snapdragon X72 5G] (PCIe MHI)" ;;
+                esac
+                MODE="CM"
+                log "Detected (sysfs PCI): $DETECTED_MODEM_NAME | driver=$mhi_drv"
+                _detect_cm_binary || return 1
+                return 0
+              fi
+            done
+          fi
+        done
+
+        for mpvid in $MEDIATEK_MBIM_VIDS; do
+          if [ "$vidpid" = "$mpvid" ]; then
+            if [ -c "$MBIM_DEVICE" ]; then
+              MODE="MBIM"
+              DETECTED_MODEM_NAME="Fibocom FM350-GL 5G (PCIe MBIM Mode)"
+              log "Detected (sysfs PCI): $DETECTED_MODEM_NAME | VID:PID=$vidpid"
+              return 0
+            else
+              log "MediaTek modem found (sysfs $vidpid) but MBIM device $MBIM_DEVICE not available."
+            fi
+          fi
+        done
+      done
+    else
+      log "detect_modem_usb: No class ff00 PCI devices found in sysfs."
+    fi
+  fi
+
+  # ── Branch C: USB detection (sysfs first, then lsusb) ─────────────────
+  log "detect_modem_usb: Scanning USB devices via sysfs..."
+  local usb_lines
+  usb_lines=$(_sysfs_usb_list)
+
+  if [ -n "$usb_lines" ]; then
+    log "detect_modem_usb: sysfs USB devices:"
+    echo "$usb_lines" | while IFS='|' read -r dn vidpid drv intf_drvs prod; do
+      log "  devnum=$dn vid:pid=$vidpid drv='$drv' intf_drvs='$intf_drvs' prod='$prod'"
+    done
+
+    for devpath in /sys/bus/usb/devices/[0-9]*; do
+      [ -d "$devpath" ] || continue
+      local dn=$(cat "$devpath/devnum" 2>/dev/null)
+      [ -z "$dn" ] && continue
+      local vid=$(cat "$devpath/idVendor" 2>/dev/null)
+      local pid=$(cat "$devpath/idProduct" 2>/dev/null)
+      local prod=$(cat "$devpath/product" 2>/dev/null)
+      local vidpid="${vid}:${pid}"
+      local drv=""
+      [ -L "$devpath/driver" ] && drv=$(basename "$(readlink -f "$devpath/driver")" 2>/dev/null)
+      local intf_drvs=""
+      for intf in "$devpath"/*/driver; do
+        [ -L "$intf" ] || continue
+        intf_drvs="$intf_drvs $(basename "$(readlink -f "$intf")" 2>/dev/null)"
+      done
+      intf_drvs=$(echo $intf_drvs | tr ' ' '\n' | sort -u | tr '\n' ' ')
+      local all_drvs="$intf_drvs $drv"
+
+      echo "$all_drvs" | grep -qE "rndis_host|cdc_ether|cdc_mbim|qmi_wwan|option" || continue
+
+      DETECTED_MODEM_NAME=$(normalize_usb_product_name "$prod")
+
+      if echo "$all_drvs" | grep -q "rndis_host"; then
+        if _is_fibocom_at "$vidpid"; then MODE="AT"; else MODE="DHCP"; fi
+      elif echo "$all_drvs" | grep -q "cdc_ether"; then
+        MODE="DHCP"
+      elif echo "$all_drvs" | grep -qE "cdc_mbim|qmi_wwan"; then
+        MODE="CM"
+        _detect_cm_binary
+      elif echo "$all_drvs" | grep -q "option"; then
+        MODE="AT"
+      else
+        continue
+      fi
+
+      log "Detected (sysfs USB): ${DETECTED_MODEM_NAME} | mode=$MODE | VID:PID=$vidpid | drivers=$all_drvs"
+      return 0
+    done
+  else
+    log "detect_modem_usb: No USB devices found in sysfs."
+  fi
+
+  # Also try lsusb if available
+  if [ $has_lsusb -eq 1 ]; then
+    log "detect_modem_usb: lsusb output: $(lsusb 2>/dev/null | tr '\n' ';')"
+    for devnum in $(_usb_all_devnums); do
+      local drivers vidpid
+      drivers=$(_drivers_for_devnum "$devnum")
+      vidpid=$(_vidpid_for_devnum "$devnum")
+      log "detect_modem_usb: lsusb devnum=$devnum vid:pid=$vidpid drivers='$drivers'"
+
+      echo "$drivers" | grep -qE "rndis_host|cdc_ether|cdc_mbim|qmi_wwan|^option$" || continue
+
+      DETECTED_MODEM_NAME=$(lsusb 2>/dev/null | grep "Device $devnum:" | sed 's/.*ID [0-9a-f]*:[0-9a-f]*[[:space:]]*//' | head -1)
+      DETECTED_MODEM_NAME=$(normalize_usb_product_name "$DETECTED_MODEM_NAME")
+
+      if echo "$drivers" | grep -q "rndis_host"; then
+        if _is_fibocom_at "$vidpid"; then MODE="AT"; else MODE="DHCP"; fi
+      elif echo "$drivers" | grep -q "cdc_ether"; then
+        MODE="DHCP"
+      elif echo "$drivers" | grep -qE "cdc_mbim|qmi_wwan"; then
+        MODE="CM"
+        _detect_cm_binary
+      elif echo "$drivers" | grep -q "^option$"; then
+        MODE="AT"
+      else
+        continue
+      fi
+
+      log "Detected (lsusb): ${DETECTED_MODEM_NAME:-unknown} | mode=$MODE | VID:PID=$vidpid | drivers=$drivers"
+      return 0
+    done
+  fi
+
+  # ── Nothing matched — dump debug info ──────────────────────────────────
+  log "ERROR: No modem detected. Dumping debug info..."
+
+  log "--- Loaded kernel modules (modem-related) ---"
+  lsmod 2>/dev/null | grep -iE 'rndis|cdc|mbim|qmi|mhi|option|usb_wwan|fibocom|mediatek|xmm|pcie|r8152|ax88179|catc' | while read -r line; do
+    log "  $line"
+  done
+
+  log "--- Network interfaces ---"
+  ip link show 2>/dev/null | grep -E '^[0-9]+:' | while read -r line; do
+    log "  $line"
+  done
+
+  log "--- /dev/wwan*, /dev/ttyUSB*, /dev/mhi_* devices ---"
+  ls -la /dev/wwan* /dev/ttyUSB* /dev/mhi_* 2>/dev/null | while read -r line; do
+    log "  $line"
+  done
+
+  return 1
+}
+
+_detect_cm_binary() {
+  for tool in $CM_TOOLS; do
+    if command -v "$tool" >/dev/null 2>&1; then
+      CM_TOOL="$tool"
+      log "quectel-CM binary: $CM_TOOL"
+      return 0
+    fi
+  done
+  log "WARNING: CM mode selected but no quectel-CM binary found. Falling back to AT mode."
+  MODE="AT"
+  return 1
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# CM MODE — quectel-CM process management
+# ══════════════════════════════════════════════════════════════════════════════
+
+start_cm() {
+  log "Starting $CM_TOOL (APN=$APN iface=$WWAN_IFACE)..."
+  : > /tmp/quectel-cm.log
+  if [ "$ENABLE_IPV6" = "1" ]; then
+    $CM_TOOL -4 -6 -s "$APN" -f /tmp/quectel-cm.log &
+  else
+    $CM_TOOL -4 -s "$APN" -f /tmp/quectel-cm.log &
+  fi
+  local waited=0
+  while [ $waited -lt 15 ]; do
+    sleep 2
+    waited=$((waited + 2))
+    modem_present || { log "Modem removed during CM startup."; kill_cm_processes; return 1; }
+    if [ -n "$WWAN_IFACE" ]; then
+      local ip
+      ip=$(ip -4 addr show dev "$WWAN_IFACE" 2>/dev/null | grep -oE 'inet [0-9.]+' | awk '{print $2}')
+      if [ -n "$ip" ]; then
+        log "quectel-CM connected. IP=$ip on $WWAN_IFACE (after ${waited}s)"
+        return 0
+      fi
+    fi
+  done
+  log "quectel-CM started but no IP seen on $WWAN_IFACE after ${waited}s — continuing anyway"
+}
+
+kill_cm_processes() {
+  local killed=0
+  for tool in $CM_TOOLS; do
+    if killall "$tool" 2>/dev/null; then
+      log "Killed $tool"
+      killed=1
+    fi
+  done
+  [ $killed -eq 0 ] && log "No CM processes found to kill"
+}
+
+cm_process_running() {
+  local tool
+  for tool in $CM_TOOLS; do
+    pidof "$tool" >/dev/null 2>&1 && return 0
+  done
+  return 1
+}
+
+modem_model_candidate_valid() {
+  local candidate
+  candidate=$(printf '%s' "$1" | tr -d '\r\n' | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')
+  [ -n "$candidate" ] || return 1
+  case "$(printf '%s' "$candidate" | tr '[:lower:]' '[:upper:]')" in
+    UNKNOWN|N/A|NONE|NULL) return 1 ;;
+  esac
+  # Firmware revisions such as 89611.1000.00.01.10.18 contain no letters.
+  printf '%s' "$candidate" | grep -q '[[:alpha:]]'
+}
+
+modem_name_is_generic() {
+  case "$1" in
+    ''|unknown|Unknown|UNKNOWN|*unknown\ USB\ device*|*Unknown\ USB\ device*|*Qualcomm\ PCIe\ Modem*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+apply_cm_model_candidate() {
+  local candidate="$1"
+  if ! modem_model_candidate_valid "$candidate"; then
+    [ -n "$candidate" ] && log "Ignoring quectel-CM model candidate '$candidate' (looks like firmware/revision); keeping: ${DETECTED_MODEM_NAME:-unknown}"
+    return 1
+  fi
+
+  if modem_name_is_generic "$DETECTED_MODEM_NAME"; then
+    DETECTED_MODEM_NAME="$candidate"
+    log "Modem model from quectel-CM: $DETECTED_MODEM_NAME"
+    return 0
+  fi
+
+  [ "$candidate" != "$DETECTED_MODEM_NAME" ] && log "quectel-CM reported model '$candidate'; keeping higher-priority detected name: $DETECTED_MODEM_NAME"
+  return 0
+}
+
+restart_cm() {
+  log "Restarting quectel-CM..."
+  kill_cm_processes
+  sleep 2
+  for tool in $CM_TOOLS; do
+    pidof "$tool" >/dev/null 2>&1 && sleep 2 && break
+  done
+  detect_wwan_iface || true
+  start_cm
+}
+
+init_cm_mode() {
+  log "=== CM mode init ==="
+  modem_present || return 1
+  for iface in $WWAN_IFACES; do ip link set "$iface" up 2>/dev/null; done
+  sleep 2
+  detect_wwan_iface && log "Pre-detected iface: $WWAN_IFACE" || log "Iface not yet visible, CM will auto-select"
+  at_cmd "$AT_DEVICE" "AT+CFUN=1" >/dev/null 2>&1 && log "Set radio up"
+  modem_present || return 1
+  configure_pdp_context
+  modem_present || return 1
+  start_cm
+  if [ -f /tmp/quectel-cm.log ]; then
+    local cm_model
+    cm_model=$(grep -o 'Modem model [^ ]*' /tmp/quectel-cm.log | head -1 | awk '{print $3}')
+    if [ -n "$cm_model" ]; then
+      apply_cm_model_candidate "$cm_model" || true
+    else
+      log "No modem model in quectel-CM log, using: $DETECTED_MODEM_NAME"
+    fi
+  fi
+  if [ -z "$WWAN_IFACE" ]; then
+    wait_for_wwan_iface || return 1
+  fi
+  configure_dhcp_interface
+  SIM_STATE="READY"
+  log "=== CM mode init complete. Interface=$WWAN_IFACE ==="
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# AT MODE — raw AT command PDP init (FM350 and similar)
+# ══════════════════════════════════════════════════════════════════════════════
+
+check_module_ready() {
+  log "Checking module ready (AT)..."
+  if at_retry "$AT_DEVICE" "AT" "OK" 10 2; then
+    log "Module ready."
+    return 0
+  fi
+  log "ERROR: Module not responding."
+  return 1
+}
+
+check_sim_ready() {
+  log "Checking SIM (AT+CPIN?)..."
+  local i=0
+  while [ $i -lt 10 ]; do
+    modem_present || { log "Modem removed during SIM check."; return 1; }
+    local resp
+    resp=$(at_cmd "$AT_DEVICE" "AT+CPIN?")
+    if echo "$resp" | grep -q "+CPIN: READY"; then
+      log "SIM ready."
+      return 0
+    elif echo "$resp" | grep -q "+CPIN: SIM PIN"; then
+      log "ERROR: SIM requires PIN."
+      return 1
+    elif echo "$resp" | grep -q "+CME ERROR: 10"; then
+      log "Please insert or check sim card ($((i + 1))/10)"
+    else
+      log "SIM not ready ($((i + 1))/10)..."
+    fi
+    i=$((i + 1))
+    sleep 2
+  done
+  log "ERROR: SIM not ready after retries."
+  return 1
+}
+
+query_sim_state() {
+  local resp
+  resp=$(at_cmd "$AT_DEVICE" "AT+CPIN?") || return 1
+  if echo "$resp" | grep -q "+CPIN: READY"; then echo "READY"
+  elif echo "$resp" | grep -q "+CME ERROR: 10"; then echo "ABSENT"
+  elif echo "$resp" | grep -q "+CPIN: NO SIM"; then echo "ABSENT"
+  elif echo "$resp" | grep -q "+CPIN: SIM PIN"; then echo "PIN"
+  elif echo "$resp" | grep -q "+CPIN: SIM PUK"; then echo "PUK"
+  else echo "OTHER"
+  fi
+}
+
+check_sim_state() {
+  [ -z "$AT_DEVICE" ] || ! [ -c "$AT_DEVICE" ] && return 0
+  local current
+  # A busy AT port is not a SIM failure. Leave the previous state untouched
+  # and try again on the next watchdog cycle.
+  current=$(query_sim_state) || return 0
+
+  if [ "$current" = "ABSENT" ]; then
+    if [ "$SIM_STATE" != "ABSENT" ]; then
+      log "SIM ejected (was $SIM_STATE). Waiting for reinsertion..."
+      SIM_STATE="ABSENT"
+    fi
+    FAIL_COUNT=0
+    return 1
+  elif [ "$current" = "READY" ] && [ "$SIM_STATE" = "ABSENT" ]; then
+    log "SIM reinserted! Re-initializing modem..."
+    SIM_STATE="READY"
+    full_reinit
+    return 1
+  elif [ "$current" = "PIN" ]; then
+    [ "$SIM_STATE" != "PIN" ] && log "WARNING: SIM PIN locked." && SIM_STATE="PIN"
+    FAIL_COUNT=0
+    return 1
+  elif [ "$current" = "PUK" ]; then
+    [ "$SIM_STATE" != "PUK" ] && log "WARNING: SIM PUK locked." && SIM_STATE="PUK"
+    FAIL_COUNT=0
+    return 1
+  elif [ "$current" = "OTHER" ]; then
+    [ "$SIM_STATE" != "NOT_READY" ] && log "SIM not ready." && SIM_STATE="NOT_READY"
+    FAIL_COUNT=0
+    return 1
+  elif [ "$current" = "READY" ] && [ "$SIM_STATE" = "NOT_READY" ]; then
+    log "SIM ready again."
+    SIM_STATE="READY"
+  elif [ "$current" = "READY" ] && [ "$SIM_STATE" = "UNKNOWN" ]; then
+    SIM_STATE="READY"
+  fi
+  return 0
+}
+
+log_modem_info() {
+  local info
+  info=$(at_cmd "$AT_DEVICE" "ATI")
+  log "Modem: $(echo "$info" | tr '\r\n' ' ')"
+}
+
+configure_pdp_context() {
+  if [ "$ENABLE_IPV6" = "1" ]; then
+	PDP_TYPE="IPV4V6"
+  else
+	PDP_TYPE="IP"
+  fi
+  log "Setting PDP context $PDP_CID APN=$APN type=$PDP_TYPE..."
+  if at_retry "$AT_DEVICE" "AT+CGDCONT=$PDP_CID,\"$PDP_TYPE\",\"$APN\"" "OK" 5 2; then
+    log "PDP context configured."
+    return 0
+  fi
+  log "ERROR: Failed to configure PDP context."
+  return 1
+}
+
+activate_pdp() {
+  log "Activating PDP context $PDP_CID..."
+  at_cmd "$AT_DEVICE" "AT+CGACT=0,$PDP_CID" >/dev/null 2>&1
+  at_cmd "$AT_DEVICE" "AT+CFUN=1" >/dev/null 2>&1
+  sleep 1
+  if at_retry "$AT_DEVICE" "AT+CGACT=1,$PDP_CID" "OK" 5 3; then
+    log "PDP context activated."
+    return 0
+  fi
+  log "ERROR: PDP activation failed."
+  return 1
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# read_ip_address — extract IP from AT+CGPADDR (simple, standard)
+# ══════════════════════════════════════════════════════════════════════════════
+# AT+CGCONTRDP is complex, many modems return an empty field 4 when there is no IPv4.
+# Using AT+CGPADDR directly is simpler and more standard. Gateway is guessed as x.x.x.1.
+# ──────────────────────────────────────────────────────────────────────────────
+read_ip_address() {
+  log "Reading IP from PDP_CID=$PDP_CID..."
+
+  # ── MBIM path ────────────────────────────────────────────────────────────
+  if [ "$MODE" = "MBIM" ] && [ -c "$MBIM_DEVICE" ]; then
+    local mbim_raw
+    mbim_raw=$(umbim -d "$MBIM_DEVICE" config 2>/dev/null)
+    ASSIGNED_IP=$(echo "$mbim_raw" | grep "ipv4address:" | awk '{print $2}' | cut -d'/' -f1)
+    ASSIGNED_GW=$(echo "$mbim_raw" | grep "ipv4gateway:" | awk '{print $2}')
+    if [ -n "$ASSIGNED_IP" ] && [ -n "$ASSIGNED_GW" ]; then
+      log "Network Parameters via MBIM: IP=$ASSIGNED_IP | Gateway=$ASSIGNED_GW"
+      return 0
+    fi
+    log "Warning: MBIM config returned empty values, trying AT fallback..."
+  fi
+
+  # ── Direct AT+CGPADDR — skipping CGCONTRDP ──────────────────────────
+  local paddr_resp
+  paddr_resp=$(at_cmd "$AT_DEVICE" "AT+CGPADDR=$PDP_CID")
+  log "AT+CGPADDR: $(echo "$paddr_resp" | tr '\r\n' ' ')"
+
+  # Extract the first IP from the response
+  ASSIGNED_IP=$(echo "$paddr_resp" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1)
+
+  # ── Guess gateway ────────────────────────────────────────────────────────
+  [ -n "$ASSIGNED_IP" ] && ASSIGNED_GW="${ASSIGNED_IP%.*}.1"
+
+  # ── Final check ──────────────────────────────────────────────────────────
+  if [ -z "$ASSIGNED_IP" ]; then
+    log "ERROR: Could not get IPv4 address from AT+CGPADDR."
+    log "HINT: Carrier may only provide IPv6. Try PDP_TYPE=\"IPV4\" instead."
+    return 1
+  fi
+
+  log "Network Parameters: IP=$ASSIGNED_IP | Gateway=$ASSIGNED_GW"
+  return 0
+}
+
+init_at_mode() {
+  log "=== AT mode init ==="
+  modem_present || return 1
+  check_module_ready || return 1
+  modem_present || return 1
+  log_modem_info
+  check_sim_ready || return 1
+  modem_present || return 1
+  configure_pdp_context || return 1
+  modem_present || return 1
+  activate_pdp || return 1
+  modem_present || return 1
+  read_ip_address || return 1
+  SIM_STATE="READY"
+  log "=== AT mode init complete. IPv4=$ASSIGNED_IP GW=$ASSIGNED_GW IPv6=${ASSIGNED_IP6:-none} ==="
+  return 0
+}
+
+init_mbim_mode() {
+  log "=== MBIM mode init (PCIe) ==="
+  modem_present || return 1
+  check_module_ready || return 1
+  modem_present || return 1
+  log_modem_info
+  check_sim_ready || return 1
+  modem_present || return 1
+
+  local rf_status
+  rf_status=$(umbim -d "$MBIM_DEVICE" radio 2>/dev/null | sed -n 's/.*swradiostate: *//p' | tr -d ' ')
+  if [ "$rf_status" = "off" ]; then
+    log "Radio is off. Turning transmitter on..."
+    umbim -d "$MBIM_DEVICE" radio on >/dev/null 2>&1
+    sleep 2
+  fi
+
+  log "Clearing legacy link allocations..."
+  umbim -d "$MBIM_DEVICE" disconnect >/dev/null 2>&1
+  sleep 1
+
+  log "Sending MBIM session activation for APN: $APN..."
+  configure_pdp_context
+  modem_present || return 1
+  if umbim -d "$MBIM_DEVICE" connect "$PDP_CID" --apn "$APN" >/dev/null 2>&1; then
+    log "MBIM data session established successfully."
+  else
+    log "ERROR: MBIM layer rejected session parameters."
+    return 1
+  fi
+
+  read_ip_address || return 1
+  SIM_STATE="READY"
+  return 0
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# INTERFACE CONFIGURATION
+# ══════════════════════════════════════════════════════════════════════════════
+
+load_config() {
+  ENABLE_IPV6=$(uci get modemmanager.main.enable_ipv6 2>/dev/null)
+}
+
+_ensure_wan_zone_iface() {
+  local iface="$1"
+  local wan_nets
+  wan_nets=$(uci get firewall.@zone[1].network 2>/dev/null)
+  if echo "$wan_nets" | grep -qw "$iface"; then
+    log "$iface already in WAN zone."
+  else
+    uci add_list firewall.@zone[1].network="$iface"
+    uci commit firewall
+    /etc/init.d/firewall reload >/dev/null 2>&1
+    log "Added $iface to WAN zone."
+  fi
+}
+
+configure_dhcp_interface() {
+  log "Configuring DHCP interface $UCI_INTERFACE_NAME → $WWAN_IFACE..."
+  uci get network.$UCI_INTERFACE_NAME >/dev/null 2>&1 || uci set network.$UCI_INTERFACE_NAME=interface
+  uci set network.$UCI_INTERFACE_NAME.proto='dhcp'
+  uci set network.$UCI_INTERFACE_NAME.device="$WWAN_IFACE"
+  uci set network.$UCI_INTERFACE_NAME.ifname="$WWAN_IFACE"
+  uci set network.$UCI_INTERFACE_NAME.metric='10'
+  uci set network.$UCI_INTERFACE_NAME.peerdns='0'
+  uci -q delete network.$UCI_INTERFACE_NAME.dns
+  uci add_list network.$UCI_INTERFACE_NAME.dns="$DNS_PRIMARY"
+  uci add_list network.$UCI_INTERFACE_NAME.dns="$DNS_SECONDARY"
+  if [ "$ENABLE_IPV6" = "1" ]; then
+    uci get network.$UCI_INTERFACE6_NAME >/dev/null 2>&1 || uci set network.$UCI_INTERFACE6_NAME=interface
+    uci set network.$UCI_INTERFACE6_NAME.proto='dhcpv6'
+    uci set network.$UCI_INTERFACE6_NAME.device="@$UCI_INTERFACE_NAME"
+    uci set network.$UCI_INTERFACE6_NAME.ifname="@$UCI_INTERFACE_NAME"
+    uci set network.$UCI_INTERFACE6_NAME.extendprefix=1
+    uci set network.$UCI_INTERFACE6_NAME.metric='10'
+    uci set network.$UCI_INTERFACE6_NAME.peerdns='0'
+    uci -q delete network.$UCI_INTERFACE6_NAME.dns
+    uci add_list network.$UCI_INTERFACE6_NAME.dns="$DNS6_PRIMARY"
+    uci add_list network.$UCI_INTERFACE6_NAME.dns="$DNS6_SECONDARY"
+  else
+    log "IPv6 dialing DISABLED"
+    # Delete IPv6 config if it exists
+    uci -q delete network.$UCI_INTERFACE6_NAME
+  fi
+  uci commit network
+  _ensure_wan_zone_iface "$UCI_INTERFACE_NAME"
+  if [ "$ENABLE_IPV6" = "1" ]; then
+    _ensure_wan_zone_iface "$UCI_INTERFACE6_NAME"
+  fi
+  /etc/init.d/network reload >/dev/null 2>&1
+  sleep 3
+  log "DHCP interface configured."
+}
+
+restart_dhcp_interface() {
+  local dhcp_iface="$UCI_INTERFACE_NAME"
+  local dhcp6_iface="$UCI_INTERFACE6_NAME"
+
+  if [ -z "$dhcp_iface" ]; then
+    log "ERROR: Cannot restart DHCP interface: logical interface name is empty."
+    return 1
+  fi
+
+  log "Restarting DHCP interface $dhcp_iface to request a new IP address..."
+  if [ "$ENABLE_IPV6" = "1" ] && [ -n "$dhcp6_iface" ]; then
+    ubus call "network.interface.$dhcp6_iface" down >/dev/null 2>&1 ||
+      log "WARNING: Failed to bring down DHCPv6 interface $dhcp6_iface."
+  fi
+  ubus call "network.interface.$dhcp_iface" down >/dev/null 2>&1 ||
+    log "WARNING: Failed to bring down DHCP interface $dhcp_iface."
+  sleep 1
+  ip link set "$WWAN_IFACE" up 2>/dev/null
+  ubus call "network.interface.$dhcp_iface" up >/dev/null 2>&1 ||
+    log "WARNING: Failed to bring up DHCP interface $dhcp_iface."
+  if [ "$ENABLE_IPV6" = "1" ] && [ -n "$dhcp6_iface" ]; then
+    ubus call "network.interface.$dhcp6_iface" up >/dev/null 2>&1 ||
+      log "WARNING: Failed to bring up DHCPv6 interface $dhcp6_iface."
+  fi
+  log "DHCP interface restart requested."
+}
+
+configure_static_interface() {
+  log "Configuring static interface $UCI_INTERFACE_NAME -> $WWAN_IFACE (IPv4=$ASSIGNED_IP GW=$ASSIGNED_GW IPv6=${ASSIGNED_IP6:-none})..."
+
+  # IPv4
+  uci get network.$UCI_INTERFACE_NAME >/dev/null 2>&1 || uci set network.$UCI_INTERFACE_NAME=interface
+  uci set network.$UCI_INTERFACE_NAME.proto='static'
+  uci set network.$UCI_INTERFACE_NAME.device="$WWAN_IFACE"
+  uci set network.$UCI_INTERFACE_NAME.ifname="$WWAN_IFACE"
+  uci set network.$UCI_INTERFACE_NAME.ipaddr="$ASSIGNED_IP"
+  uci set network.$UCI_INTERFACE_NAME.netmask="$ASSIGNED_MASK"
+  uci set network.$UCI_INTERFACE_NAME.gateway="$ASSIGNED_GW"
+  uci set network.$UCI_INTERFACE_NAME.metric='10'
+  uci set network.$UCI_INTERFACE_NAME.peerdns='0'
+  uci -q delete network.$UCI_INTERFACE_NAME.dns
+  uci add_list network.$UCI_INTERFACE_NAME.dns="$DNS_PRIMARY"
+  uci add_list network.$UCI_INTERFACE_NAME.dns="$DNS_SECONDARY"
+  if [ "$ENABLE_IPV6" = "1" ]; then
+    uci get network.$UCI_INTERFACE6_NAME >/dev/null 2>&1 || uci set network.$UCI_INTERFACE6_NAME=interface
+    uci set network.$UCI_INTERFACE6_NAME.proto='dhcpv6'
+    uci set network.$UCI_INTERFACE6_NAME.device="@$UCI_INTERFACE_NAME"
+    uci set network.$UCI_INTERFACE6_NAME.ifname="@$UCI_INTERFACE_NAME"
+    uci set network.$UCI_INTERFACE6_NAME.extendprefix=1
+    uci set network.$UCI_INTERFACE6_NAME.metric='10'
+    uci set network.$UCI_INTERFACE6_NAME.peerdns='0'
+    uci -q delete network.$UCI_INTERFACE6_NAME.dns
+    uci add_list network.$UCI_INTERFACE6_NAME.dns="$DNS6_PRIMARY"
+    uci add_list network.$UCI_INTERFACE6_NAME.dns="$DNS6_SECONDARY"
+  else
+    log "IPv6 dialing DISABLED"
+    # Delete IPv6 config if it exists
+    uci -q delete network.$UCI_INTERFACE6_NAME
+  fi
+  uci commit network
+  _ensure_wan_zone_iface "$UCI_INTERFACE_NAME"
+  if [ "$ENABLE_IPV6" = "1" ]; then
+    _ensure_wan_zone_iface "$UCI_INTERFACE6_NAME"
+  fi 
+  /etc/init.d/network reload >/dev/null 2>&1
+  log "Static interface configured."
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# INTERFACE LINK STATE HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════════════
+# WATCHDOG ESCALATION — L1 / L2 / L3
+# ══════════════════════════════════════════════════════════════════════════════
+
+_watchdog_l1() {
+  if [ "$MODE" = "MBIM" ]; then
+    log "L1: Refreshing MBIM session..."
+    umbim -d "$MBIM_DEVICE" disconnect >/dev/null 2>&1; sleep 1
+    umbim -d "$MBIM_DEVICE" connect "$PDP_CID" --apn "$APN" >/dev/null 2>&1
+    ifup "$UCI_INTERFACE_NAME" 2>/dev/null
+  elif [ "$MODE" = "CM" ]; then
+    log "L1: Restarting quectel-CM..."
+    restart_cm; sleep 3; ifup "$UCI_INTERFACE_NAME" 2>/dev/null
+  else
+    log "L1: Re-applying static IP config..."
+    ip link set "$WWAN_IFACE" up 2>/dev/null
+    ip addr flush dev "$WWAN_IFACE" 2>/dev/null
+    ip addr add "$ASSIGNED_IP/$ASSIGNED_MASK" dev "$WWAN_IFACE" 2>/dev/null
+    ip route add default via "$ASSIGNED_GW" dev "$WWAN_IFACE" metric 10 2>/dev/null
+    ifup "$UCI_INTERFACE_NAME" 2>/dev/null
+  fi
+}
+
+_watchdog_l2() {
+  if [ "$MODE" = "MBIM" ]; then
+    log "L2: Re-executing full MBIM connection loop..."
+    init_mbim_mode && configure_static_interface
+  elif [ "$MODE" = "CM" ]; then
+    log "L2: Restarting quectel-CM and reconfiguring..."
+    restart_cm; sleep 5; detect_wwan_iface && configure_dhcp_interface
+  else
+    log "L2: Re-activating PDP context..."
+    if activate_pdp && read_ip_address; then
+      configure_static_interface
+    else
+      log "L2: PDP re-init failed."
+    fi
+  fi
+}
+
+_watchdog_l3() {
+  local reason="${1:-FAIL_THRESHOLD reached}" status
+  if ! at_lock_wait 10; then
+    log "L3: Modem reset postponed because the AT port is busy."
+    return 1
+  fi
+  log "L3: $reason. Resetting modem..."
+  STATUS="rebooting"
+  DETECTED_MODEM_NAME=""
+  ATI_REVISION=""
+  TEMPERATURE=""
+  write_state_file
+  [ "$MODE" = "CM" ] && kill_cm_processes 2>/dev/null
+  restart_modem
+  full_reinit
+  status=$?
+  at_lock_release
+  return "$status"
+}
+
+# ─── PCIe single recovery layer — CFUN=4 → CFUN=1 only, quectel-CM kept alive ─
+_watchdog_pcie() {
+  log "PCIe: PCIE_RECOVER_THRESHOLD reached. Running single recovery layer (radio cycle)..."
+  if soft_restart_modem; then
+    FAIL_COUNT=0
+  else
+    log "PCIe: Radio recovery postponed because the AT port is busy."
+  fi
+}
+
+# USB CM recovery keeps a healthy quectel-CM process alive during radio cycles.
+# After repeated unsuccessful soft recoveries, fall back to the existing hard reset.
+_watchdog_usb_cm() {
+  if ! cm_process_running; then
+    log "USB CM: quectel-CM is not running. Starting it without cycling the modem..."
+    detect_wwan_iface || true
+    if start_cm; then
+      detect_wwan_iface || true
+      ifup "$UCI_INTERFACE_NAME" 2>/dev/null
+    else
+      log "USB CM: Failed to restart quectel-CM."
+    fi
+    FAIL_COUNT=0
+    return
+  fi
+
+  if [ "$USB_CM_SOFT_RECOVERY_COUNT" -lt "$USB_CM_SOFT_RECOVERY_LIMIT" ]; then
+    next_recovery=$((USB_CM_SOFT_RECOVERY_COUNT + 1))
+    log "USB CM: Running keep-alive radio cycle $next_recovery/$USB_CM_SOFT_RECOVERY_LIMIT..."
+    if soft_restart_modem; then
+      USB_CM_SOFT_RECOVERY_COUNT=$next_recovery
+      FAIL_COUNT=0
+    else
+      log "USB CM: Radio recovery postponed because the AT port is busy."
+    fi
+    return
+  fi
+
+  log "USB CM: $USB_CM_SOFT_RECOVERY_LIMIT keep-alive radio cycles failed. Falling back to hard reset..."
+  if _watchdog_l3; then
+    USB_CM_SOFT_RECOVERY_COUNT=0
+  fi
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# RE-DETECT MODEM (a different modem may have been plugged in)
+# ══════════════════════════════════════════════════════════════════════════════
+
+redetect_modem() {
+  MODE="" ; DETECTED_MODEM_NAME="" ; ATI_REVISION="" ; CM_TOOL="" ; TEMPERATURE=""
+  USB_CM_SOFT_RECOVERY_COUNT=0
+  local retries=0
+  while ! detect_modem_usb || [ -z "$MODE" ]; do
+    retries=$((retries + 1))
+    if [ $retries -ge 10 ]; then
+      log "ERROR: Modem not detected after re-init attempts."
+      return 1
+    fi
+    log "Modem re-detection failed (attempt $retries/10). Retrying in 5s..."
+    [ $retries -ge 3 ] && echo 1 > /sys/bus/pci/rescan 2>/dev/null
+    sleep 5
+  done
+  log "Modem re-detected: ${DETECTED_MODEM_NAME:-unknown} | mode=$MODE"
+  return 0
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# EXTRACT ATI MODEL / REVISION
+# ══════════════════════════════════════════════════════════════════════════════
+
+clean_at_info_value() {
+  printf '%s' "$1" |
+    tr -d '\r\n' |
+    sed 's/^[[:space:]]*//;s/[[:space:]]*$//;s/^"//;s/"$//;s/^[[:space:]]*//;s/[[:space:]]*$//'
+}
+
+extract_at_info_field() {
+  local response="$1" label="$2" value
+  value=$(printf '%s\n' "$response" | tr -d '\r' | awk -v label="$label" '
+    {
+      line=$0
+      sub(/^[[:space:]]*/, "", line)
+      prefix=toupper(label) ":"
+      if (index(toupper(line), prefix) == 1) {
+        print substr(line, length(label) + 2)
+        exit
+      }
+    }
+  ')
+  clean_at_info_value "$value"
+}
+
+parse_revision_response() {
+  local response="$1" value
+
+  value=$(extract_at_info_field "$response" "Revision")
+  [ -z "$value" ] && value=$(extract_at_info_field "$response" "+CGMR")
+
+  # Standard AT+CGMR commonly returns one bare payload line between the
+  # echoed command and OK instead of a labelled +CGMR response.
+  if [ -z "$value" ]; then
+    value=$(printf '%s\n' "$response" | tr -d '\r' | awk '
+      {
+        line=$0
+        sub(/^[[:space:]]*/, "", line)
+        sub(/[[:space:]]*$/, "", line)
+        upper=toupper(line)
+        if (line == "" || upper == "OK" || upper == "ERROR") next
+        if (upper ~ /^AT[+]CGMR[?]?$/) next
+        if (upper ~ /^[+]CME ERROR:/ || upper ~ /^[+]CMS ERROR:/) next
+        if (upper ~ /^NO RESPONSE/ || upper ~ /^FAILED/) next
+        print line
+        exit
+      }
+    ')
+    value=$(clean_at_info_value "$value")
+  fi
+
+  case "$(printf '%s' "$value" | tr '[:lower:]' '[:upper:]')" in
+    ''|OK|ERROR|*' ERROR'*|NO\ RESPONSE*|FAILED*) return 1 ;;
+  esac
+  printf '%s\n' "$value"
+}
+
+query_revision_command() {
+  local command="$1" response value attempts=0
+  while [ $attempts -lt 3 ]; do
+    response=$(at_cmd "$AT_DEVICE" "$command")
+    value=$(parse_revision_response "$response" 2>/dev/null)
+    if [ -n "$value" ]; then
+      printf '%s\n' "$value"
+      return 0
+    fi
+    attempts=$((attempts + 1))
+    [ $attempts -lt 3 ] && sleep 1
+  done
+  return 1
+}
+
+parse_identity_response() {
+  local response="$1" command="$2" value
+  value=$(printf '%s\n' "$response" | tr -d '\r' | awk -v command="$command" '
+    {
+      line=$0
+      sub(/^[[:space:]]*/, "", line)
+      sub(/[[:space:]]*$/, "", line)
+      upper=toupper(line)
+      if (line == "" || upper == "OK" || upper == "ERROR") next
+      if (upper == toupper(command)) next
+      if (upper ~ /^[+]CME ERROR:/ || upper ~ /^[+]CMS ERROR:/) next
+      if (upper ~ /^NO RESPONSE/ || upper ~ /^FAILED/) next
+      label=toupper(command)
+      sub(/^AT/, "", label)
+      if (index(upper, label ":") == 1) {
+        line=substr(line, length(label) + 2)
+        sub(/^[[:space:]]*/, "", line)
+        sub(/[[:space:]]*$/, "", line)
+      }
+      print line
+      exit
+    }
+  ')
+  value=$(clean_at_info_value "$value")
+  modem_model_candidate_valid "$value" || return 1
+  printf '%s\n' "$value"
+}
+
+query_identity_command() {
+  local command="$1" response value attempts=0
+  while [ $attempts -lt 3 ]; do
+    response=$(at_cmd "$AT_DEVICE" "$command")
+    value=$(parse_identity_response "$response" "$command" 2>/dev/null)
+    if [ -n "$value" ]; then
+      printf '%s\n' "$value"
+      return 0
+    fi
+    attempts=$((attempts + 1))
+    [ $attempts -lt 3 ] && sleep 1
+  done
+  return 1
+}
+
+extract_ati_info() {
+  if [ -n "$AT_DEVICE" ]; then
+    local ati_response ati_mfr ati_model response_mfr response_model response_revision ati_tries=0
+    while [ $ati_tries -lt 3 ]; do
+      ati_response=$(at_cmd "$AT_DEVICE" "ATI")
+      response_mfr=$(extract_at_info_field "$ati_response" "Manufacturer")
+      response_model=$(extract_at_info_field "$ati_response" "Model")
+      response_revision=$(extract_at_info_field "$ati_response" "Revision")
+      [ -n "$response_mfr" ] && ati_mfr="$response_mfr"
+      [ -n "$response_model" ] && ati_model="$response_model"
+      [ -n "$response_revision" ] && ATI_REVISION="$response_revision"
+      if modem_model_candidate_valid "$ati_model" && [ -n "$ATI_REVISION" ]; then
+        break
+      fi
+      ati_tries=$((ati_tries + 1))
+      [ $ati_tries -lt 3 ] && sleep 1
+    done
+    # ATI contains several bare information lines, so only its labelled
+    # Revision field is eligible here. Dedicated CGMM/CGMI/CGMR queries may
+    # safely use their first bare payload line as a fallback.
+
+    # Some modems answer ATI incompletely immediately after a radio or USB
+    # re-init. Use the standard identity commands before retaining the generic
+    # USB product string (for example, "Fibocom FM160 Modem_SN:...").
+    if ! modem_model_candidate_valid "$ati_model"; then
+      ati_model=$(query_identity_command "AT+CGMM")
+    fi
+    if ! modem_model_candidate_valid "$ati_mfr"; then
+      ati_mfr=$(query_identity_command "AT+CGMI")
+    fi
+
+    if [ -n "$ati_model" ] && modem_model_candidate_valid "$ati_model"; then
+      if [ -n "$ati_mfr" ]; then
+        case "$ati_model" in
+          "$ati_mfr"*) DETECTED_MODEM_NAME="$ati_model" ;;
+          *) DETECTED_MODEM_NAME="${ati_mfr} ${ati_model}" ;;
+        esac
+      else
+        DETECTED_MODEM_NAME="$ati_model"
+      fi
+      log "Modem model from ATI: $DETECTED_MODEM_NAME"
+    elif [ -n "$ati_model" ]; then
+      log "Ignoring ATI model candidate '$ati_model' (looks like firmware/revision); keeping: ${DETECTED_MODEM_NAME:-unknown}"
+    fi
+
+    # Fibocom firmware exposes revision through AT+CGMR?; most other vendors
+    # use the 3GPP AT+CGMR form. Try the alternate form only when necessary.
+    if [ -z "$ATI_REVISION" ]; then
+      case "$DETECTED_MODEM_NAME" in
+        *Fibocom*|*FM[0-9]*)
+          ATI_REVISION=$(query_revision_command "AT+CGMR?")
+          [ -z "$ATI_REVISION" ] && ATI_REVISION=$(query_revision_command "AT+CGMR")
+          ;;
+        *)
+          ATI_REVISION=$(query_revision_command "AT+CGMR")
+          [ -z "$ATI_REVISION" ] && ATI_REVISION=$(query_revision_command "AT+CGMR?")
+          ;;
+      esac
+    fi
+
+    if [ -n "$ATI_REVISION" ]; then
+      log "Modem revision: $ATI_REVISION"
+    else
+      log "WARNING: Modem revision unavailable from ATI/CGMR."
+    fi
+  fi
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# FULL RE-INIT (unplug / reboot recovery)
+# ══════════════════════════════════════════════════════════════════════════════
+
+restart_modem() {
+  if ! modem_present; then
+    log "Modem not present, skipping AT reset command."
+    return 1
+  fi
+  log "Sending modem reset: $AT_RESTART_CMD"
+  at_cmd "$AT_DEVICE" "$AT_RESTART_CMD" >/dev/null 2>&1
+  log "Waiting 20s for modem reboot..."
+  sleep 20
+}
+
+# ─── Bus type detection (PCIe/MHI vs USB) ─────────────────────────────────────
+_is_pcie_modem() {
+  case "$AT_DEVICE" in
+    /dev/wwan*|/dev/mhi_*) return 0 ;; # MHI/PCIe AT ports
+    *) return 1 ;;                     # /dev/ttyUSB* = USB
+  esac
+}
+
+# ─── Keep-alive radio cycle — CFUN=4 then CFUN=1 ─────────────────────────────
+soft_restart_modem() {
+  local cfun4_status cfun1_status
+  if ! modem_present; then
+    log "Modem not present, skipping AT soft reset."
+    return 1
+  fi
+  if ! at_lock_wait 10; then
+    return 1
+  fi
+  log "Radio recovery: AT+CFUN=4 then AT+CFUN=1 (quectel-CM kept alive when running)"
+  at_cmd_raw "$AT_DEVICE" "AT+CFUN=4" >/dev/null 2>&1
+  cfun4_status=$?
+  sleep 3
+  at_cmd_raw "$AT_DEVICE" "AT+CFUN=1" >/dev/null 2>&1
+  cfun1_status=$?
+  at_lock_release
+  if [ "$cfun4_status" -ne 0 ] || [ "$cfun1_status" -ne 0 ]; then
+    log "Radio recovery: CFUN command failed."
+    return 1
+  fi
+  log "Waiting 10s for modem to re-register..."
+  sleep 10
+}
+
+full_reinit() {
+  log "=== Full re-init triggered ==="
+  begin_modem_session
+  [ "$MODE" = "CM" ] && kill_cm_processes
+  AT_DEVICE="" ; WWAN_IFACE="" ; ASSIGNED_IP="" ; ASSIGNED_GW="" ; ASSIGNED_IP6=""
+  FAIL_COUNT=0 ; SIM_STATE="UNKNOWN" ; USB_CM_SOFT_RECOVERY_COUNT=0
+
+  # Re-detect modem type — a different modem may have been plugged in
+  redetect_modem || return 1
+
+  case "$MODE" in
+    AT|MBIM|CM|DHCP) wait_for_at_device || { log "Modem gone. Returning to watchdog loop."; return 1; } ;;
+    *) log "ERROR: Unsupported mode during re-init: $MODE"; return 1 ;;
+  esac
+
+  case "$MODE" in
+    MBIM)
+      until init_mbim_mode; do
+        modem_present || { log "Modem gone during MBIM init."; return 1; }
+        log "MBIM init failed. Retrying in 5s..."
+        sleep 5;
+      done
+      for iface in $WWAN_IFACES; do ip link set "$iface" up 2>/dev/null; done
+      sleep 3; wait_for_wwan_iface || return 1; configure_static_interface
+      ;;
+    CM) init_cm_mode || return 1 ;;
+    DHCP)
+      configure_pdp_context
+      for iface in $WWAN_IFACES; do ip link set "$iface" up 2>/dev/null; done
+      sleep 3; wait_for_wwan_iface || return 1; configure_dhcp_interface
+      ;;
+    AT)
+      until init_at_mode; do
+        modem_present || { log "Modem gone during AT init."; return 1; }
+        log "AT init failed. Retrying in 5s..."
+        sleep 5
+      done
+      for iface in $WWAN_IFACES; do ip link set "$iface" up 2>/dev/null; done
+      sleep 3; wait_for_wwan_iface || return 1; configure_static_interface
+      ;;
+    *) log "ERROR: Unsupported mode during re-init: $MODE"; return 1 ;;
+  esac
+
+  # Refresh model/revision for the (possibly new) modem
+  extract_ati_info
+  log "=== Full re-init complete (modem: ${DETECTED_MODEM_NAME:-unknown}, mode: $MODE) ==="
+}
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STARTUP
+# ══════════════════════════════════════════════════════════════════════════════
+
+log "========================================="
+log "Universal Modem Manager starting (PID $$)"
+log "========================================="
+
+load_config
+detect_at_tool
+
+# Call detect_modem_usb once — avoid redundant calls
+if ! detect_modem_usb || [ -z "$MODE" ]; then
+  log "Modem not detected on first pass. Retrying with PCI rescan..."
+  retries=0
+  while ! detect_modem_usb || [ -z "$MODE" ]; do
+    retries=$((retries + 1))
+    if [ $retries -ge 10 ]; then
+      log "ERROR: Modem not detected after $retries attempts. Exiting."
+      exit 1
+    fi
+    log "Modem not detected yet (attempt $retries/10). Retrying in 10s..."
+    [ $retries -ge 3 ] && echo 1 > /sys/bus/pci/rescan 2>/dev/null
+    sleep 10
+  done
+fi
+
+if [ -z "$MODE" ]; then
+  log "ERROR: Could not detect modem mode."
+  exit 1
+fi
+
+# Write initial state file for LuCI
+STATUS="connecting"
+write_state_file
+
+case "$MODE" in
+  AT|MBIM|CM|DHCP) wait_for_at_device || { log "ERROR: No AT device at startup. Exiting."; exit 1; } ;;
+  *) log "ERROR: Unsupported mode before init: $MODE"; exit 1 ;;
+esac
+
+case "$MODE" in
+  MBIM)
+    until init_mbim_mode; do
+      modem_present || { log "Modem gone during startup MBIM init. Exiting."; exit 1; }
+      log "MBIM init failed. Retrying in 5s..."
+      sleep 5;
+    done
+    for iface in $WWAN_IFACES; do ip link set "$iface" up 2>/dev/null; done
+    sleep 3; wait_for_wwan_iface || exit 1; configure_static_interface
+    ;;
+  CM) init_cm_mode || { log "ERROR: CM mode init failed at startup. Exiting."; exit 1; } ;;
+  DHCP)
+    log "=== DHCP mode init ==="
+    configure_pdp_context
+    for iface in $WWAN_IFACES; do ip link set "$iface" up 2>/dev/null; done
+    sleep 3; wait_for_wwan_iface || exit 1; configure_dhcp_interface
+    log "=== DHCP mode init complete. Interface=$WWAN_IFACE ==="
+    ;;
+  AT)
+    until init_at_mode; do
+      modem_present || { log "Modem gone during startup AT init. Exiting."; exit 1; }
+      log "AT init failed. Retrying in 5s..."
+      sleep 5
+    done
+    for iface in $WWAN_IFACES; do ip link set "$iface" up 2>/dev/null; done
+    sleep 3; wait_for_wwan_iface || exit 1; configure_static_interface
+    ;;
+  *) log "ERROR: Unsupported mode during startup init: $MODE"; exit 1 ;;
+esac
+
+# Extract modem model/revision from ATI (overrides quectel-CM/USB name)
+extract_ati_info
+
+log "Modem: ${DETECTED_MODEM_NAME:-unknown} | Mode: $MODE | APN: $APN | AT tool: $AT_TOOL"
+
+# Init complete — mark as connected
+STATUS="connected"
+write_state_file
+
+# ══════════════════════════════════════════════════════════════════════════════
+# WATCHDOG LOOP
+# ══════════════════════════════════════════════════════════════════════════════
+
+log "Entering watchdog loop (ping $PING_TARGET every ${PING_INTERVAL}s, mode=$MODE)..."
+
+while true; do
+  # Periodic temperature query (~30s at 3s interval)
+  TEMP_TICK=$((TEMP_TICK + 1))
+  if [ $TEMP_TICK -ge 3 ] && [ -n "$AT_DEVICE" ] && [ -c "$AT_DEVICE" ]; then
+    TEMP_TICK=0
+    query_temperature
+  fi
+
+  # SIM state monitoring
+  if ! at_transaction_active && { [ "$MODE" = "AT" ] || [ "$MODE" = "MBIM" ]; }; then
+    if ! check_sim_state; then
+      case "$SIM_STATE" in
+        ABSENT) STATUS="sim_absent" ;;
+        PIN|PUK) STATUS="sim_locked" ;;
+        NOT_READY) STATUS="sim_not_ready" ;;
+        *) STATUS="connecting" ;;
+      esac
+      write_state_file
+      sleep "$PING_INTERVAL"
+      continue
+    fi
+  fi
+
+  # AT device presence
+  if [ -n "$AT_DEVICE" ] && ! [ -c "$AT_DEVICE" ]; then
+    log "AT device $AT_DEVICE gone. Triggering full re-init..."
+    STATUS="no_modem"
+    write_state_file
+    if full_reinit; then
+      STATUS="connecting"
+    else
+      STATUS="no_modem"
+    fi
+    write_state_file
+    continue
+  fi
+
+  # Modem replugged — AT_DEVICE is empty, try to re-detect
+  if [ -z "$AT_DEVICE" ]; then
+    STATUS="no_modem"
+    write_state_file
+    if detect_at_device; then
+      log "Modem re-detected: $AT_DEVICE. Re-initializing connection..."
+      STATUS="connecting"
+      write_state_file
+      if full_reinit; then
+        STATUS="connecting"
+      else
+        STATUS="no_modem"
+      fi
+      write_state_file
+    fi
+    sleep "$PING_INTERVAL"
+    continue
+  fi
+
+  # WWAN interface presence
+  if ! ip link show "$WWAN_IFACE" >/dev/null 2>&1; then
+    log "Interface $WWAN_IFACE disappeared. Re-detecting..."
+    WWAN_IFACE=""
+    wait_for_wwan_iface
+    if [ "$MODE" = "AT" ] || [ "$MODE" = "MBIM" ]; then
+      configure_static_interface
+    else
+      configure_dhcp_interface
+    fi
+    FAIL_COUNT=0
+  fi
+
+  # Ping check
+  if ping -c 1 -W 2 "$PING_TARGET" >/dev/null 2>&1; then
+    [ $FAIL_COUNT -gt 0 ] && log "Connectivity restored after $FAIL_COUNT failures."
+    FAIL_COUNT=0
+    USB_CM_SOFT_RECOVERY_COUNT=0
+    STATUS="connected"
+  else
+    FAIL_COUNT=$((FAIL_COUNT + 1))
+    STATUS="connecting"
+    CURRENT_FAIL_THRESHOLD="$FAIL_THRESHOLD"
+    [ "$MODE" = "DHCP" ] && CURRENT_FAIL_THRESHOLD="$DHCP_REBOOT_THRESHOLD"
+    log "Ping failed ($FAIL_COUNT/$CURRENT_FAIL_THRESHOLD). $((CURRENT_FAIL_THRESHOLD - FAIL_COUNT)) until modem reset."
+  fi
+  write_state_file
+
+  # PCIe modems (MHI) — single recovery layer: CFUN=4 → CFUN=1, quectel-CM kept alive.
+  # No L1/L2/L3 escalation and no CFUN=1,1 hard reset.
+  if _is_pcie_modem; then
+    if [ $FAIL_COUNT -ge $PCIE_RECOVER_THRESHOLD ]; then
+      _watchdog_pcie
+    fi
+    sleep $PING_INTERVAL
+    continue
+  fi
+
+  # USB modems in CM mode use keep-alive radio cycles before a hard reset.
+  if [ "$MODE" = "CM" ]; then
+    if [ $FAIL_COUNT -ge $PCIE_RECOVER_THRESHOLD ]; then
+      _watchdog_usb_cm
+    fi
+    sleep $PING_INTERVAL
+    continue
+  fi
+
+  # DHCP mode waits longer and never uses the AT-mode static IP / PDP recovery
+  # stages. Keep counting after the radio cycle so ten more failed pings cause
+  # the hard reboot at DHCP_REBOOT_THRESHOLD.
+  if [ "$MODE" = "DHCP" ]; then
+    if [ $FAIL_COUNT -eq $DHCP_RADIO_RECOVER_THRESHOLD ]; then
+      log "DHCP: $DHCP_RADIO_RECOVER_THRESHOLD failed pings. Running radio cycle (CFUN=4 -> CFUN=1)..."
+      if soft_restart_modem; then
+        restart_dhcp_interface
+      else
+        # Retry this threshold on the next failed ping instead of silently
+        # skipping the only DHCP radio-recovery layer.
+        FAIL_COUNT=$((DHCP_RADIO_RECOVER_THRESHOLD - 1))
+        log "DHCP: Radio recovery postponed because the AT port is busy."
+      fi
+    elif [ $FAIL_COUNT -ge $DHCP_REBOOT_THRESHOLD ]; then
+      _watchdog_l3 "DHCP_REBOOT_THRESHOLD reached ($DHCP_REBOOT_THRESHOLD failed pings)"
+      continue
+    fi
+    sleep $PING_INTERVAL
+    continue
+  fi
+
+  # L1: 5 fails → re-apply network config
+  if [ $FAIL_COUNT -eq 5 ]; then
+    _watchdog_l1
+  fi
+
+  # L2: 10 fails → full state reconstruction
+  if [ $FAIL_COUNT -eq 10 ]; then
+    _watchdog_l2
+  fi
+
+  # L3: threshold → full modem reset + re-init
+  if [ $FAIL_COUNT -ge $FAIL_THRESHOLD ]; then
+    _watchdog_l3
+    continue
+  fi
+
+  sleep $PING_INTERVAL
+done
