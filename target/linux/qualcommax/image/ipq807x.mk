@@ -504,6 +504,21 @@ define Device/tcl_hh500v
 endef
 TARGET_DEVICES += tcl_hh500v
 
+define Device/hisense_5g-cpe
+	$(call Device/FitImage)
+	$(call Device/UbiFit)
+	DEVICE_VENDOR := HISENSE
+	DEVICE_MODEL := 5G-CPE
+	BLOCKSIZE := 128k
+	PAGESIZE := 2048
+	DEVICE_DTS_CONFIG := config@hk09
+	SOC := ipq8072
+	IMAGES += factory.bin
+	IMAGE/factory.bin := append-ubi | qsdk-ipq-factory-nand
+	DEVICE_PACKAGES :=
+endef
+TARGET_DEVICES += hisense_5g-cpe
+
 define Device/tplink_eap660hd-v1
 	$(call Device/FitImage)
 	$(call Device/UbiFit)

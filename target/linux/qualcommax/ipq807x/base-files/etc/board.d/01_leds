@@ -49,6 +49,9 @@ tcl,hh500v)
 	ucidef_set_led_netdev "wlan2g" "WiFi 2.4GHz" "blue:wlan" "phy0ap1"
 	ucidef_set_led_netdev "5G" "5G" "blue:5g" "rmnet_mhi0"
 	;;
+hisense,5g-cpe)
+	ucidef_set_led_netdev "wlan5g" "WiFi 5GHz" "led_5g" "phy0-ap0"
+	;;
 xiaomi,ax3600)
 	ucidef_set_led_netdev "wan-port-link" "WAN-PORT-LINK" "90000.mdio-1:01:green:wan" "wan" "tx rx link_10 link_100 link_1000"
 	ucidef_set_led_netdev "lan1-port-link" "LAN1-PORT-LINK" "90000.mdio-1:02:green:lan" "lan1" "tx rx link_10 link_100 link_1000"

@@ -88,6 +88,7 @@ ALLWIFIBOARDS:= \
 	smwave_srs821 \
 	spectrum_sax1v1k \
 	swaiot_s10sky \
+	hisense_5g-cpe \
 	tcl_linkhub-hh500v \
 	tplink_deco-x80-5g \
 	tplink_eap610-outdoor \
@@ -285,6 +286,7 @@ $(eval $(call generate-ipq-wifi-package,skspruce_wia3300-20,SKSpruce WIA3300-20)
 $(eval $(call generate-ipq-wifi-package,smwave_srs821,SMWave SRS821))
 $(eval $(call generate-ipq-wifi-package,spectrum_sax1v1k,Spectrum SAX1V1K))
 $(eval $(call generate-ipq-wifi-package,swaiot_s10sky,Swaiot S10-SKY))
+$(eval $(call generate-ipq-wifi-package,hisense_5g-cpe,Hisense 5G-CPE))
 $(eval $(call generate-ipq-wifi-package,tcl_linkhub-hh500v,TCL LINKHUB HH500V))
 $(eval $(call generate-ipq-wifi-package,tplink_deco-x80-5g,TP-Link Deco X80-5G))
 $(eval $(call generate-ipq-wifi-package,tplink_eap610-outdoor,TPLink EAP610-Outdoor))

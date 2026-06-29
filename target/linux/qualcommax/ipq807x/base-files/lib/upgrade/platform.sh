@@ -180,6 +180,7 @@ platform_do_upgrade() {
 	dynalink,dl-wrx36|\
 	edimax,cax1800|\
 	swaiot,s10sky|\
+	hisense,5g-cpe|\
 	netgear,rax120v2|\
 	netgear,rbr750|\
 	netgear,rbs750|\

@@ -84,6 +84,9 @@ ipq807x_setup_interfaces()
 	swaiot,s10sky)
 		ucidef_set_interfaces_lan_wan "lan1 lan2" "wan"
 		;;
+	hisense,5g-cpe)
+		ucidef_set_interfaces_lan_wan "lan1 lan2" "wan"
+		;;
 	*)
 		echo "Unsupported hardware. Network interfaces not initialized"
 		;;
