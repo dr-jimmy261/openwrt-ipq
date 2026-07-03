@@ -3,7 +3,7 @@
 
 /dts-v1/;
 
-#include "ipq8074-512m.dtsi"
+#include "ipq8074.dtsi"
 #include "ipq8074-ac-cpu.dtsi"
 #include "ipq8074-ess.dtsi"
 #include "ipq8074-nss.dtsi"
@@ -130,47 +130,24 @@
 		};
 	};
 
-	pcie0_default_state: pcie0_default_state {
-
+	pcie0_sdx_gpio: pcie0_sdx_gpio {
+	
 		pcie0_wake {
 			drive-strength = <8>;
 			function = "pcie0_wake";
 			pins = "gpio59";
-			bias-pull-down;
-		};
-		
-		pcie0_rst {
-			drive-strength = <8>;
-			function = "pcie0_rst";
-			pins = "gpio58";
-			bias-pull-down;
-		};
-	};
-
-	pcie_sdx_gpio: pcie_sdx_gpio {
-
-		ap2mdm_err_ftl {
-			pins = "gpio27";
-			function = "gpio";
-			drive-strength = <8>;
-			bias-pull-down;
+			bias-pull-up;
 		};
 
-		ap2mdm_gp_rst_n {
+		// t7xx pcie need this to power up
+		ap2mdm_gp_rst_n { 
 			pins = "gpio29";
 			function = "gpio";
 			drive-strength = <8>;
 			output-high;
 		};
-
-		sdx_pon_gpio58 {
-			pins = "gpio58";
-			function = "gpio";
-			drive-strength = <8>;
-			bias-pull-up;
-			output-high;
-		};
-
+		
+		// sdx platform need both 30-35 to powerup
 		sdx_pon_gpio30 {
 			pins = "gpio30";
 			function = "gpio";
@@ -181,21 +158,6 @@
 
 		sdx_pon_gpio35 {
 			pins = "gpio35";
-			function = "gpio";
-			drive-strength = <8>;
-			bias-pull-up;
-			output-high;
-		};
-
-		mdm2ap_err_ftl {
-			pins = "gpio33";
-			function = "gpio";
-			drive-strength = <8>;
-			bias-pull-down;
-		};
-
-		ap2mdm_status {
-			pins = "gpio26";
 			function = "gpio";
 			drive-strength = <8>;
 			bias-pull-up;
@@ -379,8 +341,9 @@
 
 &pcie0 {
 	status = "okay";
-	pinctrl-0 = <&pcie0_default_state &pcie_sdx_gpio>;
+	pinctrl-0 = <&pcie0_sdx_gpio>;
 	pinctrl-names = "default";
+	perst-gpio = <&tlmm 58 GPIO_ACTIVE_LOW>;
 };
 
 &wifi {
