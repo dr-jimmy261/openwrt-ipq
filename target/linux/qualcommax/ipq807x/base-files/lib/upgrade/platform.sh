@@ -278,9 +278,13 @@ platform_do_upgrade() {
 		tplink_do_upgrade "$1"
 		;;
 	tcl,hh500v)
-		tcl_upgrade_prepare
 		nand_do_upgrade "$1"
 		;;
+	inseego,fg2000)
+		CI_KERNPART="0:HLOS_1"
+		CI_ROOTPART="rootfs_1"
+		emmc_do_upgrade "$1"
+		;;		
 	yuncore,ax880)
 		active="$(fw_printenv -n active)"
 		if [ "$active" -eq "1" ]; then
@@ -334,6 +338,7 @@ platform_copy_config() {
 	prpl,haze|\
 	qnap,301w|\
 	spectrum,sax1v1k|\
+	inseego,fg2000|\
 	zyxel,nbg7815)
 		emmc_copy_config
 		;;
