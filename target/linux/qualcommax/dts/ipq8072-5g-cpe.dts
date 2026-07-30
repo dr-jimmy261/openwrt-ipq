@@ -72,33 +72,6 @@
 	};
 };
 
-/*&reserved_memory {
-	wcnss@4b000000 {
-		no-map;
-		reg = <0x0 0x4b000000 0x0 0x5f00000>;
-	};
-
-	tzapp@4a400000 {
-		no-map;
-		reg = <0x0 0x4a400000 0x0 0x200000>;
-	};
-
-	q6_etr_dump@50f00000 {
-		no-map;
-		reg = <0x0 0x50f00000 0x0 0x100000>;
-	};
-
-	wifi_dump@51000000 {
-		no-map;
-		reg = <0x0 0x51000000 0x0 0x600000>;
-	};
-
-	wigig_dump@51200000 {
-		no-map;
-		reg = <0x0 0x51200000 0x0 0x400000>;
-	};
-};*/
-
 &tlmm {
 	button_pins: button-pins {
 		reset_button {
@@ -152,28 +125,54 @@
 	};
 
 	pcie_pins: pcie-pins {
-		pcie0_rst {
-			pins = "gpio58";
-			function = "pcie0_rst";
-			drive-strength = <8>;
-			bias-pull-down;
-		};
+
 		pcie0_wake {
 			pins = "gpio59";
 			function = "pcie0_wake";
 			drive-strength = <8>;
+			bias-pull-up;
+		};
+
+		/*pcie0_rst {
+			pins = "gpio58";
+			function = "pcie0_rst";
+			drive-strength = <8>;
 			bias-pull-down;
+		};*/
+
+		mux_0 {
+			pins = "gpio0";
+			function = "gpio";
+			bias-pull-up;
+		};
+
+		mux_1 {
+			pins = "gpio9";
+			function = "gpio";
+			bias-pull-up;
+		};
+
+		mux_2 {
+			pins = "gpio29";
+			function = "gpio";
+			bias-pull-up;
+		};
+
+		mux_3 {
+			pins = "gpio56";
+			function = "gpio";
+			bias-pull-up;
 		};
 	};
 	
-	usb_mux_pins {
+	/*usb_mux_pins {
 		mux {
 			pins = "gpio27";
 			function = "gpio";
 			drive-strength = <8>;
 			bias-pull-down;
 		};
-	};
+	};*/
 };
 
 &blsp1_uart5 {
@@ -205,10 +204,11 @@
 
 &qpic_nand {
 	status = "okay";
-	pinctrl-0 = <&qpic_pins>;
-	pinctrl-names = "default";
+	compatible = "qcom,ebi2-nandc-bam-v1.5.0", "qcom,ipq8074-nand";
 
 	nand@0 {
+		#address-cells = <1>;
+		#size-cells = <1>;
 		reg = <0>;
 		nand-ecc-strength = <8>;
 		nand-ecc-step-size = <512>;
@@ -236,15 +236,7 @@
 	status = "okay";
 };
 
-&qusb_phy_1 {
-	status = "okay";
-};
-
 &ssphy_0 {
-	status = "okay";
-};
-
-&ssphy_1 {
 	status = "okay";
 };
 
@@ -252,9 +244,18 @@
 	status = "okay";
 };
 
-&usb_1 {
+// this usb_phy1 belong to the m2_pcie --> usb expose
+/*&qusb_phy_1 {
 	status = "okay";
 };
+
+&ssphy_1 {
+	status = "okay";
+};
+
+&usb_1 {
+	status = "okay";
+};*/
 
 &mdio {
 	status = "okay";

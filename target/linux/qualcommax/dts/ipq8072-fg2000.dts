@@ -235,15 +235,11 @@
 	status = "okay";
 
 	flash@0 {
-		compatible = "jedec,spi-nor";
+		compatible = "n25q128a11", "jedec,spi-nor";
 		spi-max-frequency = <50000000>;
 		#address-cells = <1>;
 		#size-cells = <1>;
 		reg = <0>;
-
-		partitions {
-			compatible = "qcom,smem-part";
-		};
 	};
 };
 

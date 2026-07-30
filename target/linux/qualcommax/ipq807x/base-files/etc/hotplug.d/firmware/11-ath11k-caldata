@@ -26,19 +26,21 @@ case "$FIRMWARE" in
 	compex,wpq873|\
 	dynalink,dl-wrx36|\
 	edgecore,eap102|\
-	swaiot,s10sky|\
-	hisense,5g-cpe|\
 	edimax,cax1800|\
 	linksys,mx5300|\
 	netgear,wax218|\
 	qnap,301w|\
 	redmi,ax6|\
-	inseego,fg2000|\
 	xiaomi,ax3600|\
 	xiaomi,ax9000|\
 	yuncore,ax880|\
 	zte,mf269)
 		caldata_extract "0:art" 0x1000 0x20000
+		;;
+	swaiot,s10sky|\
+	hisense,5g-cpe|\
+	inseego,fg2000)
+		caldata_extract "0:ART" 0x1000 0x20000
 		;;
 	linksys,homewrk|\
 	linksys,mx4200v1|\
